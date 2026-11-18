@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 
 die() {
+    if declare -F progress_hide >/dev/null 2>&1; then progress_hide; fi
     printf 'build_apple.sh: %s\n' "$*" >&2
     exit 1
 }
@@ -23,6 +24,7 @@ Options:
   --ssh <user@host>        Build on a macOS host and copy results back
   --output-root <path>     Repository/output root; defaults to this repository
   --vcpkg-root <path>      Existing vcpkg checkout on the build host
+  --cache-root <path>      Persistent dependency cache root
   --jobs <number>          Parallel build jobs
   --log-level <level>      off, error, warn, info, debug or trace (default: off)
   --progress <mode>        auto, always or never (default: auto)
@@ -82,7 +84,7 @@ EOF
         die "SWIG $version failed the C# Doxygen probe"
     fi
     compgen -G "$probe_root/csharp/*.cs" >/dev/null || die "SWIG $version did not generate C# output for the Doxygen probe"
-    printf 'using SWIG %s with C# Doxygen support\n' "$version"
+    progress_log "using SWIG $version with C# Doxygen support"
 }
 
 normalize_rid() {
@@ -98,6 +100,13 @@ ABIS=()
 OUTPUT_ROOT="$REPO_ROOT"
 SSH_TARGET=""
 REQUESTED_VCPKG_ROOT="${VCPKG_ROOT:-}"
+if [[ -n "${ASSIMP_VIEW_MAUI_DEPS_ROOT:-}" ]]; then
+    CACHE_ROOT="$ASSIMP_VIEW_MAUI_DEPS_ROOT"
+elif [[ -n "${XDG_CACHE_HOME:-}" ]]; then
+    CACHE_ROOT="$XDG_CACHE_HOME/assimp-view-maui"
+else
+    CACHE_ROOT="$HOME/Library/Caches/Assimp.View.Maui"
+fi
 JOBS="${CMAKE_BUILD_PARALLEL_LEVEL:-}"
 SKIP_INSTALL=false
 REMOTE_BUILD=false
@@ -150,6 +159,15 @@ while (($# > 0)); do
             (($# >= 2)) || die "$1 requires a value"
             REQUESTED_VCPKG_ROOT="$2"
             shift 2
+            ;;
+        --cache-root)
+            (($# >= 2)) || die "$1 requires a value"
+            CACHE_ROOT="$2"
+            shift 2
+            ;;
+        --cache-root=*)
+            CACHE_ROOT="${1#*=}"
+            shift
             ;;
         --jobs)
             (($# >= 2)) || die "$1 requires a value"
@@ -284,18 +302,22 @@ run_logged() {
 
     if [[ "$LOG_LEVEL" != off ]]; then
         if [[ "$LOG_LEVEL" == debug || "$LOG_LEVEL" == trace ]]; then
-            printf '[debug] %s:' "$label" >&2
-            printf ' %q' "$@" >&2
-            printf '\n' >&2
+            local command_line
+            printf -v command_line '%q ' "$@"
+            progress_log "[debug] $label: $command_line"
         fi
-        "$@" >&2 2>&1
-        return $?
+        set +e
+        "$@" 2>&1 | stream_logged_output
+        status=${PIPESTATUS[0]}
+        set -e
+        return "$status"
     fi
 
     if "$@" >>"$COMMAND_LOG" 2>&1; then
         return 0
     else
         status=$?
+        progress_hide
         printf '[error] %s failed; command log follows:\n' "$label" >&2
         tail -n 200 "$COMMAND_LOG" >&2 || true
         return "$status"
@@ -349,8 +371,28 @@ progress_draw() {
     printf ' %s' "$label" >&2
 }
 
+progress_hide() {
+    if [[ "$PROGRESS_ENABLED" == true ]]; then
+        printf '\r\033[2K' >&2
+    fi
+}
+
+progress_log() {
+    progress_hide
+    printf '%s\n' "$1" >&2
+    progress_draw "${PROGRESS_LABEL:-}" "$PROGRESS_COMPLETED" "$PROGRESS_TOTAL"
+}
+
+stream_logged_output() {
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        progress_log "$line"
+    done
+}
+
 progress_update() {
     PROGRESS_COMPLETED=$((PROGRESS_COMPLETED + 1))
+    PROGRESS_LABEL="$1"
     progress_draw "$1" "$PROGRESS_COMPLETED" "$PROGRESS_TOTAL"
 }
 
@@ -358,6 +400,25 @@ progress_finish() {
     if [[ "$PROGRESS_ENABLED" == true ]]; then
         printf '\n' >&2
         PROGRESS_ENABLED=false
+    fi
+}
+
+prepare_dependency_cache() {
+    mkdir -p "$CACHE_ROOT/downloads" "$CACHE_ROOT/binary-cache"
+    export VCPKG_DOWNLOADS="$CACHE_ROOT/downloads"
+    export VCPKG_DEFAULT_BINARY_CACHE="$CACHE_ROOT/binary-cache"
+}
+
+source_fingerprint() {
+    local source_root="$1"
+    local revision dirty untracked
+    revision="$(git -C "$source_root" rev-parse HEAD 2>/dev/null || true)"
+    if [[ -n "$revision" ]]; then
+        dirty="$(git -C "$source_root" diff --binary HEAD 2>/dev/null | shasum -a 256 | awk '{print $1}')"
+        untracked="$(git -C "$source_root" ls-files --others --exclude-standard -z 2>/dev/null | while IFS= read -r -d '' file; do shasum -a 256 "$source_root/$file"; done | shasum -a 256 | awk '{print $1}')"
+        printf '%s:%s:%s\n' "$revision" "$dirty" "$untracked"
+    else
+        find "$source_root" -type f -exec shasum -a 256 {} \; | LC_ALL=C sort | shasum -a 256 | awk '{print $1}'
     fi
 }
 
@@ -374,6 +435,7 @@ install_host_dependencies() {
 }
 
 prepare_vcpkg() {
+    prepare_dependency_cache
     if [[ -n "$REQUESTED_VCPKG_ROOT" && -f "$REQUESTED_VCPKG_ROOT/vcpkg" ]]; then
         printf '%s\n' "$REQUESTED_VCPKG_ROOT"
         return
@@ -383,17 +445,58 @@ prepare_vcpkg() {
         source_root="$REPO_ROOT/lib/assimp_view/contrib/osre/contrib/vcpkg"
     fi
     [[ -d "$source_root" ]] || die "vcpkg source not found: $source_root"
-    local local_root="$JOB_ROOT/vcpkg"
+    local source_hash
+    source_hash="$(source_fingerprint "$source_root")"
+    local cached_root="$CACHE_ROOT/vcpkg"
+    local marker="$cached_root/.assimp-view-source-hash"
+    if [[ -x "$cached_root/vcpkg" && -f "$marker" && "$(<"$marker")" == "$source_hash" ]]; then
+        printf '%s\n' "$cached_root"
+        return
+    fi
+
+    local cache_lock="$CACHE_ROOT/.vcpkg.lock"
+    until mkdir "$cache_lock" 2>/dev/null; do
+        if [[ -f "$cache_lock/pid" ]]; then
+            local owner_pid
+            owner_pid="$(<"$cache_lock/pid")"
+            if [[ "$owner_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
+                rm -rf -- "$cache_lock"
+                continue
+            fi
+        fi
+        sleep 0.2
+    done
+    printf '%s\n' "$BASHPID" > "$cache_lock/pid"
+    if [[ -x "$cached_root/vcpkg" && -f "$marker" && "$(<"$marker")" == "$source_hash" ]]; then
+        rm -f -- "$cache_lock/pid"
+        rmdir "$cache_lock"
+        printf '%s\n' "$cached_root"
+        return
+    fi
+
+    local local_root="$JOB_ROOT/vcpkg-cache-staging"
+    rm -rf -- "$local_root"
     mkdir -p "$local_root"
-    cp -a "$source_root/." "$local_root/"
+    if ! cp -a "$source_root/." "$local_root/"; then
+        rm -f -- "$cache_lock/pid"
+        rmdir "$cache_lock"
+        die "could not stage vcpkg from $source_root"
+    fi
     if [[ ! -f "$local_root/vcpkg" ]]; then
-        [[ -x "$local_root/bootstrap-vcpkg.sh" ]] || die "bootstrap-vcpkg.sh not found in $source_root"
-        if ! (cd "$local_root" && run_logged 'vcpkg bootstrap' ./bootstrap-vcpkg.sh -disableMetrics); then
+        [[ -f "$local_root/bootstrap-vcpkg.sh" ]] || { rm -f -- "$cache_lock/pid"; rmdir "$cache_lock"; die "bootstrap-vcpkg.sh not found in $source_root"; }
+        if ! (cd "$local_root" && run_logged 'vcpkg bootstrap' bash ./bootstrap-vcpkg.sh -disableMetrics); then
+            rm -f -- "$cache_lock/pid"
+            rmdir "$cache_lock"
             die 'vcpkg bootstrap failed'
         fi
     fi
-    [[ -f "$local_root/vcpkg" ]] || die 'vcpkg bootstrap failed'
-    printf '%s\n' "$local_root"
+    [[ -f "$local_root/vcpkg" ]] || { rm -f -- "$cache_lock/pid"; rmdir "$cache_lock"; die 'vcpkg bootstrap failed'; }
+    printf '%s\n' "$source_hash" > "$local_root/.assimp-view-source-hash"
+    rm -rf -- "$cached_root"
+    mv "$local_root" "$cached_root"
+    rm -f -- "$cache_lock/pid"
+    rmdir "$cache_lock"
+    printf '%s\n' "$cached_root"
 }
 
 prepare_overlay() {
@@ -492,7 +595,7 @@ bool AssimpView::Initialize(int width, int height) {
         0, 0, static_cast<OSRE::ui32>(width), static_cast<OSRE::ui32>(height),
         "Assimp View", OSRE::App::WindowMode::Windowed,
         OSRE::App::WindowType::Root,
-        OSRE::RenderBackend::RenderBackendType::OpenGLRenderBackend);
+        OSRE::App::RenderBackendType::OpenGLRenderBackend);
     return m_impl->initialized;
 }
 
@@ -696,6 +799,7 @@ require_command clang++
 require_command ar
 progress_update 'Apple toolchain'
 
+prepare_dependency_cache
 VCPKG_ROOT_EFFECTIVE="$(prepare_vcpkg)"
 progress_update 'vcpkg toolchain'
 OVERLAY_ROOT="$(prepare_overlay)"
@@ -785,6 +889,6 @@ for rid in "${ABIS[@]}"; do
     compgen -G "$JOB_ROOT/publish/$rid/native/*" >/dev/null || die "no Apple native libraries were generated for $rid"
     publish "$rid"
     progress_update "publish $rid"
-    printf 'built Apple %s (%s)\n' "$rid" "$platform"
+    progress_log "built Apple $rid ($platform)"
 done
 

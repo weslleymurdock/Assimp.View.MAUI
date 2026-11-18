@@ -4,6 +4,7 @@ param(
     [string[]]$Rid,
     [string]$OutputRoot,
     [string]$VcpkgRoot,
+    [string]$CacheRoot,
     [int]$Jobs = 0,
     [ValidateSet('off', 'error', 'warn', 'info', 'debug', 'trace')]
     [string]$LogLevel = 'off',
@@ -20,8 +21,21 @@ if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
 else {
     $OutputRoot = [IO.Path]::GetFullPath($OutputRoot)
 }
+if ([string]::IsNullOrWhiteSpace($CacheRoot)) {
+    $CacheRoot = if (-not [string]::IsNullOrWhiteSpace($env:ASSIMP_VIEW_MAUI_DEPS_ROOT)) {
+        $env:ASSIMP_VIEW_MAUI_DEPS_ROOT
+    }
+    else {
+        Join-Path $env:LOCALAPPDATA 'Assimp.View.Maui\deps'
+    }
+}
+$CacheRoot = [IO.Path]::GetFullPath($CacheRoot)
+New-Item -ItemType Directory -Path (Join-Path $CacheRoot 'downloads'), (Join-Path $CacheRoot 'binary-cache') -Force | Out-Null
+$env:VCPKG_DOWNLOADS = Join-Path $CacheRoot 'downloads'
+$env:VCPKG_DEFAULT_BINARY_CACHE = Join-Path $CacheRoot 'binary-cache'
 
 function Fail([string]$Message) {
+    if (Get-Command Clear-GradientProgress -ErrorAction SilentlyContinue) { Clear-GradientProgress }
     throw "build_windows.ps1: $Message"
 }
 
@@ -61,18 +75,27 @@ function Require-Command([string]$Name) {
     }
 }
 
-function Invoke-Logged([string]$Label, [string]$FilePath, [string[]]$Arguments) {
+function Invoke-Logged([string]$Label, [string]$FilePath, [string[]]$Arguments, [int[]]$AllowedExitCodes = @(0)) {
     if ($LogLevel -ne 'off') {
         if ($LogLevel -in @('debug', 'trace')) {
-            Write-Host ("[debug] {0}: {1} {2}" -f $Label, $FilePath, ($Arguments -join ' '))
+            Write-ProgressLog ("[debug] {0}: {1} {2}" -f $Label, $FilePath, ($Arguments -join ' '))
         }
-        & $FilePath @Arguments
+        if ($ProgressEnabled) {
+            & $FilePath @Arguments 2>&1 | ForEach-Object {
+                Clear-GradientProgress
+                [Console]::Error.WriteLine([string]$_)
+                Draw-GradientProgress
+            }
+        }
+        else {
+            & $FilePath @Arguments
+        }
     }
     else {
         & $FilePath @Arguments >> $CommandLog 2>&1
     }
     $status = $LASTEXITCODE
-    if ($status -ne 0) {
+    if ($status -notin $AllowedExitCodes) {
         if ($LogLevel -eq 'off') {
             [Console]::Error.WriteLine("[error] $Label failed; command log follows:")
             Get-Content -LiteralPath $CommandLog -Tail 200 | ForEach-Object { [Console]::Error.WriteLine($_) }
@@ -85,6 +108,7 @@ $ProgressEnabled = $false
 $ProgressCompleted = 0
 $ProgressTotal = 0
 $ProgressFrame = 0
+$ProgressLabel = ''
 
 function Initialize-GradientProgress([int]$Total) {
     $script:ProgressTotal = $Total
@@ -95,9 +119,14 @@ function Initialize-GradientProgress([int]$Total) {
     }
 }
 
-function Update-GradientProgress([string]$Label) {
+function Clear-GradientProgress {
+    if ($ProgressEnabled) {
+        [Console]::Error.Write("`r$([char]27)[2K")
+    }
+}
+
+function Draw-GradientProgress {
     if (-not $ProgressEnabled) { return }
-    $script:ProgressCompleted++
     $width = 28
     $percent = 0
     if ($ProgressTotal -gt 0) {
@@ -121,7 +150,20 @@ function Update-GradientProgress([string]$Label) {
             [Console]::Error.Write("$esc[38;2;55;48;163m─$esc[0m")
         }
     }
-    [Console]::Error.Write(" $Label")
+    [Console]::Error.Write(" $ProgressLabel")
+}
+
+function Update-GradientProgress([string]$Label) {
+    if (-not $ProgressEnabled) { return }
+    $script:ProgressCompleted++
+    $script:ProgressLabel = $Label
+    Draw-GradientProgress
+}
+
+function Write-ProgressLog([string]$Message) {
+    Clear-GradientProgress
+    [Console]::Error.WriteLine($Message)
+    Draw-GradientProgress
 }
 
 function Complete-GradientProgress {
@@ -167,7 +209,7 @@ public:
     if (-not (Get-ChildItem -LiteralPath $probeCsharp -Filter '*.cs' -File)) {
         Fail "SWIG $version did not generate C# output for the Doxygen probe"
     }
-    Write-Host "using SWIG $version with C# Doxygen support"
+    Write-ProgressLog "using SWIG $version with C# Doxygen support"
 }
 
 function Install-WingetPackage([string]$Id) {
@@ -212,9 +254,10 @@ function Ensure-VisualStudio {
     $vswhere = Find-VsWhere
     if (-not $vswhere -and -not $SkipInstall) {
         if (Get-Command winget -ErrorAction SilentlyContinue) {
-            & winget install --id Microsoft.VisualStudio.2022.BuildTools --exact --silent --accept-source-agreements --accept-package-agreements `
-                --override '--wait --quiet --norestart --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.Tools.ARM64 --includeRecommended'
-            if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) { Fail "Visual Studio Build Tools installation failed: $LASTEXITCODE" }
+            Invoke-Logged 'Visual Studio Build Tools install' 'winget' @(
+                'install', '--id', 'Microsoft.VisualStudio.2022.BuildTools', '--exact', '--silent',
+                '--accept-source-agreements', '--accept-package-agreements',
+                '--override', '--wait --quiet --norestart --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.VC.Tools.ARM64 --includeRecommended') @(0, 3010)
         }
         else {
             $installer = Join-Path $JobRoot 'vs_BuildTools.exe'
@@ -240,6 +283,48 @@ function Copy-Tree([string]$Source, [string]$Destination) {
     }
 }
 
+function Get-SourceFingerprint([string]$Source) {
+    $revision = (& git -C $Source rev-parse HEAD 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -eq 0 -and $revision) {
+        $status = (& git -C $Source status --porcelain --untracked-files=all 2>$null | Out-String).Trim()
+        if (-not $status) { return "$revision`:clean" }
+        $hashes = Get-ChildItem -LiteralPath $Source -Recurse -File | Sort-Object FullName | Get-FileHash -Algorithm SHA256
+        return "$revision`:" + (($hashes | ForEach-Object { "$($_.Hash)  $($_.Path)" }) -join "`n")
+    }
+    $hashes = Get-ChildItem -LiteralPath $Source -Recurse -File | Sort-Object FullName | Get-FileHash -Algorithm SHA256
+    return (($hashes | ForEach-Object { "$($_.Hash)  $($_.Path)" }) -join "`n" | Out-String).Trim()
+}
+
+function Enter-DependencyCacheLock {
+    $lock = Join-Path $CacheRoot '.vcpkg.lock'
+    while ($true) {
+        try {
+            New-Item -ItemType Directory -Path $lock -ErrorAction Stop | Out-Null
+            Set-Content -LiteralPath (Join-Path $lock 'pid') -Value $PID -NoNewline
+            return $lock
+        }
+        catch {
+            $ownerPath = Join-Path $lock 'pid'
+            if (Test-Path -LiteralPath $ownerPath) {
+                $ownerText = (Get-Content -LiteralPath $ownerPath -Raw).Trim()
+                $ownerPid = 0
+                if ([int]::TryParse($ownerText, [ref]$ownerPid)) {
+                    $owner = Get-Process -Id $ownerPid -ErrorAction SilentlyContinue
+                    if ($null -eq $owner) {
+                        Remove-Item -LiteralPath $lock -Recurse -Force -ErrorAction SilentlyContinue
+                        continue
+                    }
+                }
+            }
+            Start-Sleep -Milliseconds 200
+        }
+    }
+}
+
+function Exit-DependencyCacheLock([string]$Lock) {
+    Remove-Item -LiteralPath $Lock -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 function Prepare-Vcpkg {
     $source = $VcpkgRoot
     if ([string]::IsNullOrWhiteSpace($source)) {
@@ -249,17 +334,40 @@ function Prepare-Vcpkg {
         $source = Join-Path $RepoRoot 'lib\assimp_view\contrib\osre\contrib\vcpkg'
     }
     if (-not (Test-Path -LiteralPath $source -PathType Container)) { Fail "vcpkg source not found: $source" }
-    $local = Join-Path $JobRoot 'vcpkg'
-    Copy-Tree $source $local
-    $exe = Join-Path $local 'vcpkg.exe'
-    if (-not (Test-Path -LiteralPath $exe)) {
-        $bootstrap = Join-Path $local 'bootstrap-vcpkg.bat'
-        if (-not (Test-Path -LiteralPath $bootstrap)) { Fail "bootstrap-vcpkg.bat not found in $source" }
-        & cmd.exe /d /c "`"$bootstrap`" -disableMetrics"
-        if ($LASTEXITCODE -ne 0) { Fail "vcpkg bootstrap failed: $LASTEXITCODE" }
+    $sourceHash = Get-SourceFingerprint $source
+    $cached = Join-Path $CacheRoot 'vcpkg'
+    $marker = Join-Path $cached '.assimp-view-source-hash'
+    if ((Test-Path -LiteralPath (Join-Path $cached 'vcpkg.exe')) -and
+        (Test-Path -LiteralPath $marker) -and
+        ((Get-Content -LiteralPath $marker -Raw).Trim() -eq $sourceHash)) {
+        return $cached
     }
-    if (-not (Test-Path -LiteralPath $exe)) { Fail 'vcpkg bootstrap did not create vcpkg.exe' }
-    return $local
+
+    $cacheLock = Enter-DependencyCacheLock
+    try {
+        if ((Test-Path -LiteralPath (Join-Path $cached 'vcpkg.exe')) -and
+            (Test-Path -LiteralPath $marker) -and
+            ((Get-Content -LiteralPath $marker -Raw).Trim() -eq $sourceHash)) {
+            return $cached
+        }
+
+        $local = Join-Path $JobRoot 'vcpkg-cache-staging'
+        Copy-Tree $source $local
+        $exe = Join-Path $local 'vcpkg.exe'
+        if (-not (Test-Path -LiteralPath $exe)) {
+            $bootstrap = Join-Path $local 'bootstrap-vcpkg.bat'
+            if (-not (Test-Path -LiteralPath $bootstrap)) { Fail "bootstrap-vcpkg.bat not found in $source" }
+            Invoke-Logged 'vcpkg bootstrap' 'cmd.exe' @('/d', '/c', "`"$bootstrap`" -disableMetrics")
+        }
+        if (-not (Test-Path -LiteralPath $exe)) { Fail 'vcpkg bootstrap did not create vcpkg.exe' }
+        Set-Content -LiteralPath (Join-Path $local '.assimp-view-source-hash') -Value $sourceHash -NoNewline
+        if (Test-Path -LiteralPath $cached) { Remove-Item -LiteralPath $cached -Recurse -Force }
+        Move-Item -LiteralPath $local -Destination $cached
+        return $cached
+    }
+    finally {
+        Exit-DependencyCacheLock $cacheLock
+    }
 }
 
 function Prepare-Overlay {
@@ -345,7 +453,7 @@ bool AssimpView::Initialize(int width, int height) {
     if (m_impl == nullptr || m_impl->initialized) return m_impl != nullptr;
     m_impl->initialized = m_impl->app.initWindow(0, 0, static_cast<OSRE::ui32>(width), static_cast<OSRE::ui32>(height),
         "Assimp View", OSRE::App::WindowMode::Windowed, OSRE::App::WindowType::Root,
-        OSRE::RenderBackend::RenderBackendType::OpenGLRenderBackend);
+        OSRE::App::RenderBackendType::OpenGLRenderBackend);
     return m_impl->initialized;
 }
 bool AssimpView::LoadAsset(const char *path) {
@@ -553,7 +661,7 @@ try {
         }
         Publish $targetRid $nativeStage
         Update-GradientProgress "publish $targetRid"
-        Write-Host "built Windows $targetRid ($vsInstallation)" -ForegroundColor Green
+        Write-ProgressLog "built Windows $targetRid ($vsInstallation)"
     }
 }
 finally {

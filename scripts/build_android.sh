@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 
 die() {
+    if declare -F progress_hide >/dev/null 2>&1; then progress_hide; fi
     printf 'build_android.sh: %s\n' "$*" >&2
     exit 1
 }
@@ -20,6 +21,7 @@ temporary directory.  With no --abi/--rid option all Android ABIs are built.
 Options:
   --abi <abi> [...]        One or more: armeabi-v7a, arm64-v8a, x86, x86_64
   --rid <rid> [...]        One or more: android-arm, android-arm64, android-x86, android-x86_64
+  --ssh <user@host>        Build on a Linux host and copy results back
   --output-root <path>     Repository/output root; defaults to this repository
   --vcpkg-root <path>      Existing vcpkg checkout
   --ndk-version <version>  Android NDK version (default: 26.1.10909125)
@@ -27,6 +29,7 @@ Options:
   --jobs <number>          Parallel build jobs
   --log-level <level>      off, error, warn, info, debug or trace (default: off)
   --progress <mode>        auto, always or never (default: auto)
+  --cache-root <path>      Persistent dependency cache root
   --skip-install           Reuse preinstalled host/SDK/vcpkg dependencies
   -h, --help               Show this help
 EOF
@@ -78,7 +81,7 @@ EOF
         die "SWIG $version failed the C# Doxygen probe"
     fi
     compgen -G "$probe_root/csharp/*.cs" >/dev/null || die "SWIG $version did not generate C# output for the Doxygen probe"
-    printf 'using SWIG %s with C# Doxygen support\n' "$version"
+    progress_log "using SWIG $version with C# Doxygen support"
 }
 
 normalize_rid() {
@@ -103,16 +106,47 @@ android_abi() {
 
 vcpkg_triplet() {
     case "$1" in
-        android-arm) printf '%s\n' arm-android ;;
-        android-arm64) printf '%s\n' arm64-android ;;
-        android-x86) printf '%s\n' x86-android ;;
-        android-x86_64) printf '%s\n' x64-android ;;
+        android-arm) printf '%s\n' assimpview-arm-android ;;
+        android-arm64) printf '%s\n' assimpview-arm64-android ;;
+        android-x86) printf '%s\n' assimpview-x86-android ;;
+        android-x86_64) printf '%s\n' assimpview-x64-android ;;
         *) die "unsupported Android RID '$1'" ;;
     esac
 }
 
+write_android_triplet() {
+    local triplet="$1"
+    local rid="$2"
+    local abi="$3"
+    local architecture host_triplet
+    case "$rid" in
+        android-arm) architecture=arm; host_triplet=armv7a-linux-androideabi ;;
+        android-arm64) architecture=arm64; host_triplet=aarch64-linux-android ;;
+        android-x86) architecture=x86; host_triplet=i686-linux-android ;;
+        android-x86_64) architecture=x64; host_triplet=x86_64-linux-android ;;
+        *) die "unsupported Android RID '$rid'" ;;
+    esac
+    mkdir -p "$JOB_ROOT/triplets"
+    cat > "$JOB_ROOT/triplets/$triplet.cmake" <<EOF
+set(VCPKG_TARGET_ARCHITECTURE $architecture)
+set(VCPKG_CRT_LINKAGE dynamic)
+set(VCPKG_LIBRARY_LINKAGE static)
+set(VCPKG_CMAKE_SYSTEM_NAME Android)
+set(VCPKG_CMAKE_SYSTEM_VERSION $ANDROID_API)
+set(VCPKG_MAKE_BUILD_TRIPLET "--host=$host_triplet")
+set(VCPKG_CMAKE_CONFIGURE_OPTIONS
+    "-DANDROID_ABI=$abi"
+    "-DANDROID_PLATFORM=android-$ANDROID_API"
+    "-DANDROID_NDK=$ANDROID_NDK_HOME"
+    "-DANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+    "-DANDROID_NDK_ROOT=$ANDROID_NDK_HOME")
+EOF
+}
+
 ABIS=()
 OUTPUT_ROOT="$REPO_ROOT"
+SSH_TARGET=""
+REMOTE_BUILD=false
 REQUESTED_VCPKG_ROOT="${VCPKG_ROOT:-}"
 NDK_VERSION="${ANDROID_NDK_VERSION:-26.1.10909125}"
 ANDROID_API="${ANDROID_MIN_SDK_VERSION:-24}"
@@ -120,6 +154,7 @@ JOBS="${CMAKE_BUILD_PARALLEL_LEVEL:-}"
 SKIP_INSTALL=false
 LOG_LEVEL=off
 PROGRESS_MODE=auto
+CACHE_ROOT="${ASSIMP_VIEW_MAUI_DEPS_ROOT:-${XDG_CACHE_HOME:-$HOME/.cache}/assimp-view-maui}"
 
 normalize_log_level() {
     case "$1" in
@@ -157,6 +192,15 @@ while (($# > 0)); do
             OUTPUT_ROOT="$(cd -- "$2" 2>/dev/null && pwd || true)"
             [[ -n "$OUTPUT_ROOT" ]] || OUTPUT_ROOT="$2"
             shift 2
+            ;;
+        --ssh)
+            (($# >= 2)) || die "$1 requires a value"
+            SSH_TARGET="$2"
+            shift 2
+            ;;
+        --remote-build)
+            REMOTE_BUILD=true
+            shift
             ;;
         --vcpkg-root)
             (($# >= 2)) || die "$1 requires a value"
@@ -196,6 +240,15 @@ while (($# > 0)); do
             PROGRESS_MODE="${1#*=}"
             shift
             ;;
+        --cache-root)
+            (($# >= 2)) || die "$1 requires a value"
+            CACHE_ROOT="$2"
+            shift 2
+            ;;
+        --cache-root=*)
+            CACHE_ROOT="${1#*=}"
+            shift
+            ;;
         --skip-install)
             SKIP_INSTALL=true
             shift
@@ -229,6 +282,53 @@ fi
 [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || die "--jobs must be a positive integer"
 [[ "$ANDROID_API" =~ ^[0-9]+$ ]] || die "--api must be an integer"
 
+if [[ -n "$SSH_TARGET" && "$REMOTE_BUILD" == false ]]; then
+    require_command ssh
+    require_command scp
+    require_command tar
+
+    LOCAL_JOB="$(mktemp -d "${TMPDIR:-/tmp}/assimp-view-maui-android-ssh.XXXXXX")"
+    cleanup_remote() { rm -rf -- "$LOCAL_JOB"; }
+    trap cleanup_remote EXIT
+
+    tar -czf "$LOCAL_JOB/source.tar.gz" \
+        --exclude='.git' --exclude='*/.git/*' \
+        -C "$REPO_ROOT" \
+        lib/assimp_view/src \
+        lib/assimp_view/contrib/osre \
+        src/Assimp.View.Maui \
+        scripts/build_android.sh
+
+    remote_dir="$(ssh "$SSH_TARGET" 'mktemp -d /tmp/assimp-view-maui-android-ssh.XXXXXX')"
+    [[ -n "$remote_dir" ]] || die 'remote temporary directory was not created'
+    cleanup_remote_with_ssh() {
+        ssh "$SSH_TARGET" "rm -rf '$remote_dir'" >/dev/null 2>&1 || true
+        rm -rf -- "$LOCAL_JOB"
+    }
+    trap cleanup_remote_with_ssh EXIT
+
+    scp "$LOCAL_JOB/source.tar.gz" "$SSH_TARGET:$remote_dir/source.tar.gz"
+    ssh "$SSH_TARGET" "cd '$remote_dir' && mkdir source && tar -xzf source.tar.gz -C source"
+
+    remote_args=(--remote-build --output-root "$remote_dir/output" --ndk-version "$NDK_VERSION" --api "$ANDROID_API" --jobs "$JOBS" --log-level "$LOG_LEVEL" --progress "$PROGRESS_MODE")
+    for rid in "${ABIS[@]}"; do
+        remote_args+=(--rid "$rid")
+    done
+    [[ "$SKIP_INSTALL" == true ]] && remote_args+=(--skip-install)
+
+    remote_command="cd '$remote_dir/source' && bash scripts/build_android.sh"
+    for ((i = 0; i < ${#remote_args[@]}; i++)); do
+        remote_command+=" '${remote_args[$i]}'"
+    done
+    ssh "$SSH_TARGET" "$remote_command"
+    ssh "$SSH_TARGET" "tar -czf '$remote_dir/result.tar.gz' -C '$remote_dir/output' src/Assimp.View.Maui/Platforms"
+    scp "$SSH_TARGET:$remote_dir/result.tar.gz" "$LOCAL_JOB/result.tar.gz"
+    mkdir -p "$OUTPUT_ROOT"
+    tar -xzf "$LOCAL_JOB/result.tar.gz" -C "$OUTPUT_ROOT"
+    printf 'Android build completed on %s and copied to %s\n' "$SSH_TARGET" "$OUTPUT_ROOT"
+    exit 0
+fi
+
 JOB_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/assimp-view-maui-android.XXXXXX")"
 LOCK_PATH=""
 
@@ -251,18 +351,22 @@ run_logged() {
 
     if [[ "$LOG_LEVEL" != off ]]; then
         if [[ "$LOG_LEVEL" == debug || "$LOG_LEVEL" == trace ]]; then
-            printf '[debug] %s:' "$label" >&2
-            printf ' %q' "$@" >&2
-            printf '\n' >&2
+            local command_line
+            printf -v command_line '%q ' "$@"
+            progress_log "[debug] $label: $command_line"
         fi
-        "$@" >&2 2>&1
-        return $?
+        set +e
+        "$@" 2>&1 | stream_logged_output
+        status=${PIPESTATUS[0]}
+        set -e
+        return "$status"
     fi
 
     if "$@" >>"$COMMAND_LOG" 2>&1; then
         return 0
     else
         status=$?
+        progress_hide
         printf '[error] %s failed; command log follows:\n' "$label" >&2
         tail -n 200 "$COMMAND_LOG" >&2 || true
         return "$status"
@@ -316,8 +420,28 @@ progress_draw() {
     printf ' %s' "$label" >&2
 }
 
+progress_hide() {
+    if [[ "$PROGRESS_ENABLED" == true ]]; then
+        printf '\r\033[2K' >&2
+    fi
+}
+
+progress_log() {
+    progress_hide
+    printf '%s\n' "$1" >&2
+    progress_draw "${PROGRESS_LABEL:-}" "$PROGRESS_COMPLETED" "$PROGRESS_TOTAL"
+}
+
+stream_logged_output() {
+    local line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        progress_log "$line"
+    done
+}
+
 progress_update() {
     PROGRESS_COMPLETED=$((PROGRESS_COMPLETED + 1))
+    PROGRESS_LABEL="$1"
     progress_draw "$1" "$PROGRESS_COMPLETED" "$PROGRESS_TOTAL"
 }
 
@@ -328,13 +452,57 @@ progress_finish() {
     fi
 }
 
+validate_android_host() {
+    [[ "$(uname -s)" == Linux ]] || die 'Android native builds require a Linux host or WSL'
+    case "$(uname -m)" in
+        x86_64|amd64) ;;
+        *) die "Android host architecture $(uname -m) is unsupported; use Linux x86_64" ;;
+    esac
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        if [[ "${ID:-}" == debian && "${VERSION_ID:-}" == 13* ]]; then
+            progress_log 'Debian 13 host detected; Android toolchain is supported'
+        else
+            progress_log "Linux host detected: ${PRETTY_NAME:-unknown distribution}"
+        fi
+    fi
+}
+
+set_android_ndk_environment() {
+    local ndk_root="$1"
+    [[ -f "$ndk_root/build/cmake/android.toolchain.cmake" ]] || die "Android NDK CMake toolchain was not found at $ndk_root/build/cmake/android.toolchain.cmake"
+    [[ -x "$ndk_root/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++" ]] || die "Android NDK Linux x86_64 Clang was not found at $ndk_root/toolchains/llvm/prebuilt/linux-x86_64/bin/clang++"
+    export ANDROID_NDK_HOME="$ndk_root"
+    export ANDROID_NDK_ROOT="$ndk_root"
+    export ANDROID_NDK="$ndk_root"
+}
+
+prepare_dependency_cache() {
+    mkdir -p "$CACHE_ROOT/downloads" "$CACHE_ROOT/binary-cache"
+    export VCPKG_DOWNLOADS="$CACHE_ROOT/downloads"
+    export VCPKG_DEFAULT_BINARY_CACHE="$CACHE_ROOT/binary-cache"
+}
+
+source_fingerprint() {
+    local source_root="$1"
+    local revision dirty untracked
+    revision="$(git -C "$source_root" rev-parse HEAD 2>/dev/null || true)"
+    if [[ -n "$revision" ]]; then
+        dirty="$(git -C "$source_root" diff --binary HEAD 2>/dev/null | sha256sum | awk '{print $1}')"
+        untracked="$(git -C "$source_root" ls-files --others --exclude-standard -z 2>/dev/null | while IFS= read -r -d '' file; do sha256sum "$source_root/$file"; done | sha256sum | awk '{print $1}')"
+        printf '%s:%s:%s\n' "$revision" "$dirty" "$untracked"
+    else
+        find "$source_root" -type f -print0 | sort -z | xargs -0 sha256sum | sha256sum | awk '{print $1}'
+    fi
+}
+
 install_host_dependencies() {
     if [[ "$SKIP_INSTALL" == true ]]; then
         return
     fi
 
     if command -v apt-get >/dev/null 2>&1; then
-        local packages=(ca-certificates cmake ninja-build swig git curl unzip tar build-essential)
+        local packages=(ca-certificates cmake ninja-build swig git curl unzip tar build-essential default-jre-headless)
         local missing=()
         local package
         for package in "${packages[@]}"; do
@@ -364,9 +532,11 @@ ensure_android_toolchain() {
     export ANDROID_SDK_ROOT="$sdk_root"
     export ANDROID_HOME="$sdk_root"
     local ndk_path="$sdk_root/ndk/$NDK_VERSION"
+    local configured_ndk="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-${ANDROID_NDK:-}}}"
 
-    if [[ -n "${ANDROID_NDK_HOME:-}" && -d "$ANDROID_NDK_HOME" ]]; then
-        export ANDROID_NDK_HOME
+    if [[ -n "$configured_ndk" ]]; then
+        [[ -d "$configured_ndk" ]] || die "configured Android NDK directory does not exist: $configured_ndk"
+        set_android_ndk_environment "$configured_ndk"
         return
     fi
 
@@ -384,6 +554,12 @@ ensure_android_toolchain() {
             sdkmanager="$sdk_root/cmdline-tools/latest/bin/sdkmanager"
         fi
         [[ -x "$sdkmanager" ]] || die "Android sdkmanager is not executable: $sdkmanager"
+        require_command java
+        if [[ -z "${JAVA_HOME:-}" || ! -x "$JAVA_HOME/bin/java" ]]; then
+            local java_path
+            java_path="$(readlink -f "$(command -v java)")"
+            export JAVA_HOME="${java_path%/bin/java}"
+        fi
         set +o pipefail
         if [[ "$LOG_LEVEL" == off ]]; then
             yes | "$sdkmanager" --sdk_root="$sdk_root" --licenses >>"$COMMAND_LOG" 2>&1 || true
@@ -395,10 +571,11 @@ ensure_android_toolchain() {
     fi
 
     [[ -d "$ndk_path" ]] || die "Android NDK was not installed at $ndk_path"
-    export ANDROID_NDK_HOME="$ndk_path"
+    set_android_ndk_environment "$ndk_path"
 }
 
 prepare_vcpkg() {
+    prepare_dependency_cache
     if [[ -n "$REQUESTED_VCPKG_ROOT" && -f "$REQUESTED_VCPKG_ROOT/vcpkg" ]]; then
         printf '%s\n' "$REQUESTED_VCPKG_ROOT"
         return
@@ -410,25 +587,159 @@ prepare_vcpkg() {
     fi
     [[ -d "$source_root" ]] || die "vcpkg source not found: $source_root"
 
-    local local_root="$JOB_ROOT/vcpkg"
+    local source_hash
+    source_hash="$(source_fingerprint "$source_root")"
+    local cached_root="$CACHE_ROOT/vcpkg"
+    local marker="$cached_root/.assimp-view-source-hash"
+    if [[ -x "$cached_root/vcpkg" && -f "$marker" && "$(<"$marker")" == "$source_hash" ]]; then
+        printf '%s\n' "$cached_root"
+        return
+    fi
+
+    local cache_lock="$CACHE_ROOT/.vcpkg.lock"
+    until mkdir "$cache_lock" 2>/dev/null; do
+        if [[ -f "$cache_lock/pid" ]]; then
+            local owner_pid
+            owner_pid="$(<"$cache_lock/pid")"
+            if [[ "$owner_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$owner_pid" 2>/dev/null; then
+                rm -rf -- "$cache_lock"
+                continue
+            fi
+        fi
+        sleep 0.2
+    done
+    printf '%s\n' "$BASHPID" > "$cache_lock/pid"
+    if [[ -x "$cached_root/vcpkg" && -f "$marker" && "$(<"$marker")" == "$source_hash" ]]; then
+        rm -f -- "$cache_lock/pid"
+        rmdir "$cache_lock"
+        printf '%s\n' "$cached_root"
+        return
+    fi
+
+    local local_root="$JOB_ROOT/vcpkg-cache-staging"
+    rm -rf -- "$local_root"
     mkdir -p "$local_root"
-    cp -a "$source_root/." "$local_root/"
+    if ! cp -a "$source_root/." "$local_root/"; then
+        rm -f -- "$cache_lock/pid"
+        rmdir "$cache_lock"
+        die "could not stage vcpkg from $source_root"
+    fi
     if [[ ! -f "$local_root/vcpkg" ]]; then
-        [[ -x "$local_root/bootstrap-vcpkg.sh" ]] || die "bootstrap-vcpkg.sh not found in $source_root"
-        if ! (cd "$local_root" && run_logged 'vcpkg bootstrap' ./bootstrap-vcpkg.sh -disableMetrics); then
+        [[ -f "$local_root/bootstrap-vcpkg.sh" ]] || { rm -f -- "$cache_lock/pid"; rmdir "$cache_lock"; die "bootstrap-vcpkg.sh not found in $source_root"; }
+        if ! (cd "$local_root" && run_logged 'vcpkg bootstrap' bash ./bootstrap-vcpkg.sh -disableMetrics); then
+            rm -f -- "$cache_lock/pid"
+            rmdir "$cache_lock"
             die 'vcpkg bootstrap failed'
         fi
     fi
-    [[ -f "$local_root/vcpkg" ]] || die "vcpkg bootstrap failed"
-    printf '%s\n' "$local_root"
+    [[ -f "$local_root/vcpkg" ]] || { rm -f -- "$cache_lock/pid"; rmdir "$cache_lock"; die 'vcpkg bootstrap failed'; }
+    printf '%s\n' "$source_hash" > "$local_root/.assimp-view-source-hash"
+    rm -rf -- "$cached_root"
+    mv "$local_root" "$cached_root"
+    rm -f -- "$cache_lock/pid"
+    rmdir "$cache_lock"
+    printf '%s\n' "$cached_root"
 }
 
 create_overlay() {
     local overlay="$JOB_ROOT/osre"
     mkdir -p "$overlay"
     cp -a "$REPO_ROOT/lib/assimp_view/contrib/osre/." "$overlay/"
+    cat > "$overlay/vcpkg.json" <<'EOF'
+{
+  "dependencies": [
+    "glm",
+    "sdl2"
+  ]
+}
+EOF
+    mkdir -p "$JOB_ROOT/android-compat/include/GL"
+    cat > "$JOB_ROOT/android-compat/include/GL/glew.h" <<'EOF'
+#pragma once
+
+#ifndef GL_GLEXT_PROTOTYPES
+#define GL_GLEXT_PROTOTYPES 1
+#endif
+
+#include <GLES3/gl3.h>
+#include <GLES2/gl2ext.h>
+
+// OSRE's OpenGL backend is shared with desktop OpenGL.  Android exposes
+// OpenGL ES instead, so provide the small compile-time compatibility surface
+// used by the reusable renderer.  Desktop-only operations are either mapped
+// to their GLES equivalent or intentionally become no-ops.
+#ifndef GL_TEXTURE_1D
+#define GL_TEXTURE_1D GL_TEXTURE_2D
+#endif
+#ifndef GL_POINT
+#define GL_POINT 0x1B00
+#endif
+#ifndef GL_LINE
+#define GL_LINE 0x1B01
+#endif
+#ifndef GL_FILL
+#define GL_FILL 0x1B02
+#endif
+#ifndef GL_GEOMETRY_SHADER
+#define GL_GEOMETRY_SHADER 0x8DD9
+#endif
+#ifndef GL_TESS_EVALUATION_SHADER
+#define GL_TESS_EVALUATION_SHADER 0x8E87
+#endif
+#ifndef GL_CONTEXT_PROFILE_MASK
+#define GL_CONTEXT_PROFILE_MASK 0x9126
+#endif
+#ifndef GL_MAX_TEXTURE_UNITS
+#define GL_MAX_TEXTURE_UNITS GL_MAX_TEXTURE_IMAGE_UNITS
+#endif
+#ifndef GL_MAX_TEXTURE_COORDS
+#define GL_MAX_TEXTURE_COORDS GL_MAX_VERTEX_ATTRIBS
+#endif
+#ifndef GL_LIGHTING
+#define GL_LIGHTING 0x0B50
+#endif
+#ifndef GL_MULTISAMPLE
+#define GL_MULTISAMPLE 0x809D
+#endif
+#ifndef GL_CLAMP
+#define GL_CLAMP GL_CLAMP_TO_EDGE
+#endif
+#ifndef GL_BGR_EXT
+#define GL_BGR_EXT GL_RGB
+#endif
+
+static inline void glFramebufferTexture(GLenum target, GLenum attachment,
+        GLuint texture, GLint level) {
+    glFramebufferTexture2D(target, attachment, GL_TEXTURE_2D, texture, level);
+}
+
+static inline void glPolygonMode(GLenum, GLenum) {
+    // Polygon mode is not part of OpenGL ES.  Filled rasterization is the
+    // only portable GLES mode and is the default on Android.
+}
+
+#ifndef GLEW_OK
+#define GLEW_OK 0
+#endif
+
+static GLboolean glewExperimental = GL_TRUE;
+static inline GLenum glewInit(void) { return GLEW_OK; }
+EOF
+    cat > "$JOB_ROOT/android-compat/include/GL/gl.h" <<'EOF'
+#pragma once
+
+#include <GL/glew.h>
+EOF
+    perl -0pi -e 's/find_package\(GLEW\s+REQUIRED\)/if(NOT ANDROID)\n    find_package(GLEW REQUIRED)\n    set(OSRE_GLEW_LINK GLEW::GLEW)\nendif()/' \
+        "$overlay/CMakeLists.txt"
+    perl -0pi -e 's/\n    glEnable\(GL_MULTISAMPLE\);/\n#if !defined(__ANDROID__)\n    glEnable(GL_MULTISAMPLE);\n#endif/' \
+        "$overlay/src/Engine/RenderBackend/OGLRenderer/OGLRenderBackend.cpp"
+    perl -0pi -e 's/ENDIF\( WIN32 \)/ENDIF( WIN32 )\nif(ANDROID)\n    list(APPEND platform_libs GLESv3)\nendif()/' \
+        "$overlay/src/Engine/CMakeLists.txt"
+    perl -0pi -e 's/#elif defined\(__gnu_linux__\)/#elif defined(__gnu_linux__) || defined(__ANDROID__)/' \
+        "$overlay/contrib/cppcore/include/cppcore/CPPCoreCommon.h"
     sed -i 's/cppcore)/$<TARGET_NAME_IF_EXISTS:cppcore>)/g' "$overlay/src/Engine/CMakeLists.txt"
-    sed -i 's/target_link_libraries ( osre cppcore zlibstatic GLEW::GLEW ${platform_libs} assimp )/target_link_libraries ( osre $<TARGET_NAME_IF_EXISTS:cppcore> $<TARGET_NAME_IF_EXISTS:zlibstatic> GLEW::GLEW ${platform_libs} $<TARGET_NAME_IF_EXISTS:assimp> )/' "$overlay/src/Engine/CMakeLists.txt"
+    sed -i 's/target_link_libraries ( osre cppcore zlibstatic GLEW::GLEW ${platform_libs} assimp )/target_link_libraries ( osre $<TARGET_NAME_IF_EXISTS:cppcore> $<TARGET_NAME_IF_EXISTS:zlibstatic> ${OSRE_GLEW_LINK} ${platform_libs} $<TARGET_NAME_IF_EXISTS:assimp> )/' "$overlay/src/Engine/CMakeLists.txt"
     printf '%s\n' "$overlay"
 }
 
@@ -530,7 +841,7 @@ bool AssimpView::Initialize(int width, int height) {
         0, 0, static_cast<OSRE::ui32>(width), static_cast<OSRE::ui32>(height),
         "Assimp View", OSRE::App::WindowMode::Windowed,
         OSRE::App::WindowType::Root,
-        OSRE::RenderBackend::RenderBackendType::OpenGLRenderBackend);
+        OSRE::App::RenderBackendType::OpenGLRenderBackend);
     return m_impl->initialized;
 }
 
@@ -620,6 +931,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${native_out}")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${native_out}")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${native_out}")
 set(CMAKE_MODULE_PATH "${overlay}/contrib/assimp/cmake-modules" \${CMAKE_MODULE_PATH})
+include_directories(BEFORE "${JOB_ROOT}/android-compat/include")
 
 set(OSRE_BUILD_PLAYER OFF CACHE BOOL "" FORCE)
 set(OSRE_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
@@ -698,6 +1010,7 @@ publish() {
 }
 
 progress_init $((4 + 4 * ${#ABIS[@]}))
+validate_android_host
 install_host_dependencies
 progress_update 'host dependencies'
 require_command cmake
@@ -707,10 +1020,13 @@ validate_swig
 if [[ "$SKIP_INSTALL" == false ]]; then
     ensure_android_toolchain
 else
-    : "${ANDROID_NDK_HOME:?ANDROID_NDK_HOME is required with --skip-install}"
+    configured_ndk="${ANDROID_NDK_HOME:-${ANDROID_NDK_ROOT:-${ANDROID_NDK:-}}}"
+    [[ -n "$configured_ndk" ]] || die 'ANDROID_NDK_HOME, ANDROID_NDK_ROOT or ANDROID_NDK is required with --skip-install'
+    set_android_ndk_environment "$configured_ndk"
 fi
-progress_update 'Android SDK and NDK'
+    progress_update 'Android SDK and NDK'
 
+prepare_dependency_cache
 VCPKG_ROOT_EFFECTIVE="$(prepare_vcpkg)"
 progress_update 'vcpkg toolchain'
 OVERLAY_ROOT="$(create_overlay)"
@@ -721,6 +1037,7 @@ progress_update 'SWIG C# bindings'
 for rid in "${ABIS[@]}"; do
     abi="$(android_abi "$rid")"
     triplet="$(vcpkg_triplet "$rid")"
+    write_android_triplet "$triplet" "$rid" "$abi"
     install_root="$JOB_ROOT/vcpkg-installed/$rid"
     native_out="$JOB_ROOT/native/$rid"
     build_dir="$JOB_ROOT/build/$rid"
@@ -729,6 +1046,7 @@ for rid in "${ABIS[@]}"; do
     if [[ "$SKIP_INSTALL" == false ]]; then
         run_logged "vcpkg install $rid" "$VCPKG_ROOT_EFFECTIVE/vcpkg" install \
             "--triplet=$triplet" \
+            "--overlay-triplets=$JOB_ROOT/triplets" \
             "--x-manifest-root=$OVERLAY_ROOT" \
             "--x-install-root=$install_root" \
             --clean-after-build
@@ -743,12 +1061,14 @@ for rid in "${ABIS[@]}"; do
         "-DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT_EFFECTIVE/scripts/buildsystems/vcpkg.cmake" \
         "-DVCPKG_CHAINLOAD_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
         "-DVCPKG_TARGET_TRIPLET=$triplet" \
+        "-DVCPKG_OVERLAY_TRIPLETS=$JOB_ROOT/triplets" \
         "-DVCPKG_INSTALLED_DIR=$install_root" \
         "-DANDROID_ABI=$abi" \
         "-DANDROID_PLATFORM=android-$ANDROID_API" \
+        "-DANDROID_NDK=$ANDROID_NDK_HOME" \
+        "-DANDROID_NDK_HOME=$ANDROID_NDK_HOME" \
         "-DANDROID_STL=c++_shared" \
         "-DCMAKE_BUILD_TYPE=Release" \
-        "-DANDROID_NDK=$ANDROID_NDK_HOME" \
         "-DUSE_PLATFORM=VK_USE_PLATFORM_ANDROID_KHR"
     progress_update "CMake configure $rid"
     run_logged "CMake build $rid" cmake --build "$build_dir" --config Release --parallel "$JOBS"
@@ -769,6 +1089,6 @@ for rid in "${ABIS[@]}"; do
     compgen -G "$JOB_ROOT/publish/$rid/native/*.so" >/dev/null || die "no Android native libraries were generated for $rid"
     publish "$rid"
     progress_update "publish $rid"
-    printf 'built Android %s (%s)\n' "$rid" "$abi"
+    progress_log "built Android $rid ($abi)"
 done
 
