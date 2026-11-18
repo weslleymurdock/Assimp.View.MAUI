@@ -18,6 +18,8 @@
 	</PropertyGroup>
 
 	<ItemGroup>
+		<!-- O viewer estende os bindings e os binários distribuídos por Assimp.Maui. -->
+		<PackageReference Include="Assimp.Maui" Version="6.0.6.0-rc1" />
 		<PackageReference Include="Microsoft.Maui.Controls" Version="$(MauiVersion)" />
 	</ItemGroup>
 
