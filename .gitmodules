@@ -1,3 +1,3 @@
-[submodule "lib/--recursive"]
-	path = lib/--recursive
+[submodule "lib/assimp_view"]
+	path = lib/assimp_view
 	url = https://github.com/assimp/assimp_view.git
