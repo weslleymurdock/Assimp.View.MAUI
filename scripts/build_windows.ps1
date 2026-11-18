@@ -5,6 +5,10 @@ param(
     [string]$OutputRoot,
     [string]$VcpkgRoot,
     [int]$Jobs = 0,
+    [ValidateSet('off', 'error', 'warn', 'info', 'debug', 'trace')]
+    [string]$LogLevel = 'off',
+    [ValidateSet('auto', 'always', 'never')]
+    [string]$Progress = 'auto',
     [switch]$SkipInstall
 )
 
@@ -48,10 +52,82 @@ if ($Jobs -le 0) {
 
 $JobRoot = Join-Path ([IO.Path]::GetTempPath()) ("assimp-view-maui-windows-" + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $JobRoot -Force | Out-Null
+$CommandLog = Join-Path $JobRoot 'commands.log'
+New-Item -ItemType File -Path $CommandLog -Force | Out-Null
 
 function Require-Command([string]$Name) {
     if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
         Fail "required command not found: $Name"
+    }
+}
+
+function Invoke-Logged([string]$Label, [string]$FilePath, [string[]]$Arguments) {
+    if ($LogLevel -ne 'off') {
+        if ($LogLevel -in @('debug', 'trace')) {
+            Write-Host ("[debug] {0}: {1} {2}" -f $Label, $FilePath, ($Arguments -join ' '))
+        }
+        & $FilePath @Arguments
+    }
+    else {
+        & $FilePath @Arguments >> $CommandLog 2>&1
+    }
+    $status = $LASTEXITCODE
+    if ($status -ne 0) {
+        if ($LogLevel -eq 'off') {
+            [Console]::Error.WriteLine("[error] $Label failed; command log follows:")
+            Get-Content -LiteralPath $CommandLog -Tail 200 | ForEach-Object { [Console]::Error.WriteLine($_) }
+        }
+        Fail "$Label failed with exit code $status"
+    }
+}
+
+$ProgressEnabled = $false
+$ProgressCompleted = 0
+$ProgressTotal = 0
+$ProgressFrame = 0
+
+function Initialize-GradientProgress([int]$Total) {
+    $script:ProgressTotal = $Total
+    switch ($Progress) {
+        'always' { $script:ProgressEnabled = $true }
+        'never' { $script:ProgressEnabled = $false }
+        'auto' { $script:ProgressEnabled = -not [Console]::IsErrorRedirected }
+    }
+}
+
+function Update-GradientProgress([string]$Label) {
+    if (-not $ProgressEnabled) { return }
+    $script:ProgressCompleted++
+    $width = 28
+    $percent = 0
+    if ($ProgressTotal -gt 0) {
+        $percent = [math]::Floor(($ProgressCompleted * 100) / $ProgressTotal)
+        $filled = [math]::Floor(($ProgressCompleted * $width) / $ProgressTotal)
+    }
+    else {
+        $filled = $ProgressFrame % ($width + 1)
+        $script:ProgressFrame++
+    }
+    $esc = [char]27
+    [Console]::Error.Write("`r$esc[2K$esc[38;2;99;102;241m[{0,3}%]$esc[0m " -f $percent)
+    for ($i = 0; $i -lt $width; $i++) {
+        if ($i -lt $filled) {
+            $red = 79 + [math]::Floor($i * 45 / $width)
+            $green = 70 - [math]::Floor($i * 12 / $width)
+            $blue = 229 + [math]::Floor($i * 8 / $width)
+            [Console]::Error.Write("$esc[38;2;{0};{1};{2}m━$esc[0m" -f $red, $green, $blue)
+        }
+        else {
+            [Console]::Error.Write("$esc[38;2;55;48;163m─$esc[0m")
+        }
+    }
+    [Console]::Error.Write(" $Label")
+}
+
+function Complete-GradientProgress {
+    if ($ProgressEnabled) {
+        [Console]::Error.WriteLine()
+        $script:ProgressEnabled = $false
     }
 }
 
@@ -64,22 +140,43 @@ function Validate-Swig {
     if ($version -lt [version]'4.3.0') {
         Fail "SWIG $version is too old; SWIG >= 4.3.0 is required for C# Doxygen comments"
     }
-    $help = (& swig -csharp -help 2>&1 | Out-String)
-    if ($LASTEXITCODE -ne 0 -or $help -notmatch '(?m)^\s*-doxygen\b') {
-        Fail "SWIG $version does not expose the C# -doxygen option"
+    $probeRoot = Join-Path $JobRoot 'swig-doxygen-probe'
+    $probeCsharp = Join-Path $probeRoot 'csharp'
+    New-Item -ItemType Directory -Path $probeCsharp -Force | Out-Null
+    @'
+#pragma once
+
+/** @brief Confirms that SWIG can translate Doxygen comments for C#. */
+class AssimpViewDoxygenProbeClass {
+public:
+    /** @brief Returns a value from the Doxygen validation probe. */
+    int Value() const;
+};
+'@ | Set-Content -LiteralPath (Join-Path $probeRoot 'probe.h') -Encoding utf8
+    @'
+%module AssimpViewDoxygenProbeModule
+%{
+#include "probe.h"
+%}
+%include "probe.h"
+'@ | Set-Content -LiteralPath (Join-Path $probeRoot 'probe.i') -Encoding utf8
+    Invoke-Logged 'SWIG C# Doxygen probe' 'swig' @(
+        '-c++', '-csharp', '-doxygen', '-namespace', 'Assimp.View.Maui',
+        "-I$probeRoot", '-outdir', $probeCsharp,
+        '-o', (Join-Path $probeRoot 'probe.cxx'), (Join-Path $probeRoot 'probe.i'))
+    if (-not (Get-ChildItem -LiteralPath $probeCsharp -Filter '*.cs' -File)) {
+        Fail "SWIG $version did not generate C# output for the Doxygen probe"
     }
     Write-Host "using SWIG $version with C# Doxygen support"
 }
 
 function Install-WingetPackage([string]$Id) {
     if (Get-Command winget -ErrorAction SilentlyContinue) {
-        & winget install --id $Id --exact --silent --accept-source-agreements --accept-package-agreements
-        if ($LASTEXITCODE -ne 0) { Fail "winget could not install $Id (exit code $LASTEXITCODE)" }
+        Invoke-Logged "winget install $Id" 'winget' @('install', '--id', $Id, '--exact', '--silent', '--accept-source-agreements', '--accept-package-agreements')
         return
     }
     if (Get-Command choco -ErrorAction SilentlyContinue) {
-        & choco install $Id -y --no-progress
-        if ($LASTEXITCODE -ne 0) { Fail "Chocolatey could not install $Id (exit code $LASTEXITCODE)" }
+        Invoke-Logged "choco install $Id" 'choco' @('install', $Id, '-y', '--no-progress')
         return
     }
     Fail "install $Id or provide it on PATH; neither winget nor choco is available"
@@ -275,7 +372,7 @@ bool AssimpView::HasModel() const { return m_impl != nullptr && m_impl->app.hasM
 '@ | Set-Content -LiteralPath (Join-Path $JobRoot 'AssimpViewBridge.cpp') -Encoding utf8
 
     @'
-%module AssimpView
+%module AssimpViewModule
 %{
 #include "AssimpViewBridge.h"
 %}
@@ -287,9 +384,10 @@ function Generate-Bindings {
     $csharp = Join-Path $JobRoot 'swig\csharp'
     $cxx = Join-Path $JobRoot 'swig\cxx'
     New-Item -ItemType Directory -Path $csharp, $cxx -Force | Out-Null
-    & swig -c++ -csharp -doxygen -namespace 'Assimp.View.Maui' -dllimport 'assimpviewmaui' `
-        "-I$JobRoot" -outdir $csharp -o (Join-Path $cxx 'assimpviewmaui.cxx') (Join-Path $JobRoot 'assimpview.i')
-    if ($LASTEXITCODE -ne 0) { Fail "SWIG failed with exit code $LASTEXITCODE" }
+    Invoke-Logged 'SWIG C# bindings' 'swig' @(
+        '-c++', '-csharp', '-doxygen', '-namespace', 'Assimp.View.Maui',
+        '-dllimport', 'assimpviewmaui', "-I$JobRoot", '-outdir', $csharp,
+        '-o', (Join-Path $cxx 'assimpviewmaui.cxx'), (Join-Path $JobRoot 'assimpview.i'))
     if (-not (Get-ChildItem -LiteralPath $csharp -Filter '*.cs' -File)) { Fail 'SWIG did not generate C# classes' }
 }
 
@@ -385,13 +483,19 @@ function Publish([string]$TargetRid, [string]$NativeStage) {
 }
 
 try {
+    Initialize-GradientProgress (5 + (4 * $Rid.Count))
     Ensure-HostDependencies
+    Update-GradientProgress 'host dependencies'
     Validate-Swig
+    Update-GradientProgress 'SWIG validation'
     $vsInstallation = Ensure-VisualStudio
+    Update-GradientProgress 'Visual Studio toolchain'
     $vcpkg = Prepare-Vcpkg
+    Update-GradientProgress 'vcpkg toolchain'
     $overlay = Prepare-Overlay
     Write-BridgeSources
     Generate-Bindings
+    Update-GradientProgress 'SWIG C# bindings'
 
     foreach ($targetRid in $Rid) {
         $vsArch = if ($targetRid -eq 'win-arm64') { 'ARM64' } else { 'x64' }
@@ -402,8 +506,9 @@ try {
         New-Item -ItemType Directory -Path $nativeOut, $buildDir, (Join-Path $JobRoot 'project') -Force | Out-Null
 
         if (-not $SkipInstall) {
-            & (Join-Path $vcpkg 'vcpkg.exe') install "--triplet=$triplet" "--x-manifest-root=$overlay" "--x-install-root=$installRoot" --clean-after-build
-            if ($LASTEXITCODE -ne 0) { Fail "vcpkg failed for ${targetRid}: $LASTEXITCODE" }
+            Invoke-Logged "vcpkg install $targetRid" (Join-Path $vcpkg 'vcpkg.exe') @(
+                'install', "--triplet=$triplet", "--x-manifest-root=$overlay",
+                "--x-install-root=$installRoot", '--clean-after-build')
         }
         else {
             $installRoot = Join-Path $vcpkg 'installed'
@@ -411,6 +516,7 @@ try {
                 Fail "--SkipInstall requires a populated vcpkg installed directory: $installRoot"
             }
         }
+        Update-GradientProgress "vcpkg $targetRid"
 
         Write-CMakeProject $overlay $nativeOut
         $cmakeArgs = @(
@@ -428,10 +534,10 @@ try {
             '-DASSIMP_BUILD_ZLIB=ON',
             '-DUSE_PLATFORM=VK_USE_PLATFORM_WIN32_KHR'
         )
-        & cmake @cmakeArgs
-        if ($LASTEXITCODE -ne 0) { Fail "CMake configure failed for ${targetRid}: $LASTEXITCODE" }
-        & cmake --build $buildDir --config Release --parallel $Jobs
-        if ($LASTEXITCODE -ne 0) { Fail "CMake build failed for ${targetRid}: $LASTEXITCODE" }
+        Invoke-Logged "CMake configure $targetRid" 'cmake' $cmakeArgs
+        Update-GradientProgress "CMake configure $targetRid"
+        Invoke-Logged "CMake build $targetRid" 'cmake' @('--build', $buildDir, '--config', 'Release', '--parallel', $Jobs)
+        Update-GradientProgress "CMake build $targetRid"
 
         $nativeStage = Join-Path $JobRoot "publish\$targetRid\native"
         New-Item -ItemType Directory -Path $nativeStage -Force | Out-Null
@@ -446,10 +552,12 @@ try {
             Fail "no Windows DLL was generated for $targetRid"
         }
         Publish $targetRid $nativeStage
+        Update-GradientProgress "publish $targetRid"
         Write-Host "built Windows $targetRid ($vsInstallation)" -ForegroundColor Green
     }
 }
 finally {
+    Complete-GradientProgress
     if (Test-Path -LiteralPath $JobRoot) {
         Remove-Item -LiteralPath $JobRoot -Recurse -Force -ErrorAction SilentlyContinue
     }

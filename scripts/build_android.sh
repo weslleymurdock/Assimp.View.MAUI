@@ -25,6 +25,8 @@ Options:
   --ndk-version <version>  Android NDK version (default: 26.1.10909125)
   --api <number>           Minimum Android API (default: 24)
   --jobs <number>          Parallel build jobs
+  --log-level <level>      off, error, warn, info, debug or trace (default: off)
+  --progress <mode>        auto, always or never (default: auto)
   --skip-install           Reuse preinstalled host/SDK/vcpkg dependencies
   -h, --help               Show this help
 EOF
@@ -48,11 +50,34 @@ validate_swig() {
     if (( major < 4 || (major == 4 && minor < 3) )); then
         die "SWIG $version is too old; SWIG >= 4.3.0 is required for C# Doxygen comments"
     fi
-    local csharp_help
-    csharp_help="$(swig -csharp -help 2>&1)" || die "SWIG $version failed while checking C# options"
-    if [[ "$csharp_help" != *-doxygen* ]]; then
-        die "SWIG $version does not expose the C# -doxygen option"
+    local probe_root="$JOB_ROOT/swig-doxygen-probe"
+    mkdir -p "$probe_root/csharp"
+    cat > "$probe_root/probe.h" <<'EOF'
+#pragma once
+
+/** @brief Confirms that SWIG can translate Doxygen comments for C#. */
+class AssimpViewDoxygenProbeClass {
+public:
+    /** @brief Returns a value from the Doxygen validation probe. */
+    int Value() const;
+};
+EOF
+    cat > "$probe_root/probe.i" <<'EOF'
+%module AssimpViewDoxygenProbeModule
+%{
+#include "probe.h"
+%}
+%include "probe.h"
+EOF
+    if ! run_logged 'SWIG C# Doxygen probe' swig -c++ -csharp -doxygen \
+        -namespace Assimp.View.Maui \
+        -I"$probe_root" \
+        -outdir "$probe_root/csharp" \
+        -o "$probe_root/probe.cxx" \
+        "$probe_root/probe.i"; then
+        die "SWIG $version failed the C# Doxygen probe"
     fi
+    compgen -G "$probe_root/csharp/*.cs" >/dev/null || die "SWIG $version did not generate C# output for the Doxygen probe"
     printf 'using SWIG %s with C# Doxygen support\n' "$version"
 }
 
@@ -93,6 +118,15 @@ NDK_VERSION="${ANDROID_NDK_VERSION:-26.1.10909125}"
 ANDROID_API="${ANDROID_MIN_SDK_VERSION:-24}"
 JOBS="${CMAKE_BUILD_PARALLEL_LEVEL:-}"
 SKIP_INSTALL=false
+LOG_LEVEL=off
+PROGRESS_MODE=auto
+
+normalize_log_level() {
+    case "$1" in
+        off|error|warn|info|debug|trace) printf '%s\n' "$1" ;;
+        *) die "invalid log level '$1' (use off, error, warn, info, debug or trace)" ;;
+    esac
+}
 
 append_abi_values() {
     local value part
@@ -144,6 +178,24 @@ while (($# > 0)); do
             JOBS="$2"
             shift 2
             ;;
+        --log-level)
+            (($# >= 2)) || die "$1 requires a value"
+            LOG_LEVEL="$(normalize_log_level "$2")"
+            shift 2
+            ;;
+        --log-level=*)
+            LOG_LEVEL="$(normalize_log_level "${1#*=}")"
+            shift
+            ;;
+        --progress)
+            (($# >= 2)) || die "$1 requires a value"
+            PROGRESS_MODE="$2"
+            shift 2
+            ;;
+        --progress=*)
+            PROGRESS_MODE="${1#*=}"
+            shift
+            ;;
         --skip-install)
             SKIP_INSTALL=true
             shift
@@ -181,12 +233,100 @@ JOB_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/assimp-view-maui-android.XXXXXX")"
 LOCK_PATH=""
 
 cleanup() {
+    progress_finish
     if [[ -n "$LOCK_PATH" ]]; then
         rmdir "$LOCK_PATH" 2>/dev/null || true
     fi
     rm -rf -- "$JOB_ROOT"
 }
 trap cleanup EXIT
+
+COMMAND_LOG="$JOB_ROOT/commands.log"
+touch "$COMMAND_LOG"
+
+run_logged() {
+    local label="$1"
+    shift
+    local status
+
+    if [[ "$LOG_LEVEL" != off ]]; then
+        if [[ "$LOG_LEVEL" == debug || "$LOG_LEVEL" == trace ]]; then
+            printf '[debug] %s:' "$label" >&2
+            printf ' %q' "$@" >&2
+            printf '\n' >&2
+        fi
+        "$@" >&2 2>&1
+        return $?
+    fi
+
+    if "$@" >>"$COMMAND_LOG" 2>&1; then
+        return 0
+    else
+        status=$?
+        printf '[error] %s failed; command log follows:\n' "$label" >&2
+        tail -n 200 "$COMMAND_LOG" >&2 || true
+        return "$status"
+    fi
+}
+
+PROGRESS_ENABLED=false
+PROGRESS_COMPLETED=0
+PROGRESS_TOTAL=0
+PROGRESS_FRAME=0
+
+progress_init() {
+    PROGRESS_TOTAL="$1"
+    case "$PROGRESS_MODE" in
+        always) PROGRESS_ENABLED=true ;;
+        never) PROGRESS_ENABLED=false ;;
+        auto) [[ -t 2 && "${TERM:-dumb}" != dumb ]] && PROGRESS_ENABLED=true || PROGRESS_ENABLED=false ;;
+        *) die "invalid progress mode '$PROGRESS_MODE' (use auto, always or never)" ;;
+    esac
+}
+
+progress_draw() {
+    local label="$1"
+    local completed="$2"
+    local total="$3"
+    local width=28
+    local filled=0
+    local percent=0
+    local i red green blue
+
+    [[ "$PROGRESS_ENABLED" == true ]] || return 0
+    if (( total > 0 )); then
+        percent=$((completed * 100 / total))
+        filled=$((completed * width / total))
+    else
+        filled=$((PROGRESS_FRAME % (width + 1)))
+        PROGRESS_FRAME=$((PROGRESS_FRAME + 1))
+    fi
+
+    printf '\r\033[2K\033[38;2;99;102;241m[%3d%%]\033[0m ' "$percent" >&2
+    for ((i = 0; i < width; i++)); do
+        if (( i < filled )); then
+            red=$((79 + i * 45 / width))
+            green=$((70 - i * 12 / width))
+            blue=$((229 + i * 8 / width))
+            printf '\033[38;2;%d;%d;%dm━\033[0m' "$red" "$green" "$blue" >&2
+        else
+            printf '\033[38;2;55;48;163m─\033[0m' >&2
+        fi
+    done
+    printf ' %s' "$label" >&2
+}
+
+progress_update() {
+    PROGRESS_COMPLETED=$((PROGRESS_COMPLETED + 1))
+    progress_draw "$1" "$PROGRESS_COMPLETED" "$PROGRESS_TOTAL"
+}
+
+progress_finish() {
+    if [[ "$PROGRESS_ENABLED" == true ]]; then
+        printf '\n' >&2
+        PROGRESS_ENABLED=false
+    fi
+}
 
 install_host_dependencies() {
     if [[ "$SKIP_INSTALL" == true ]]; then
@@ -202,12 +342,12 @@ install_host_dependencies() {
         done
         if ((${#missing[@]} > 0)); then
             if [[ "$(id -u)" == 0 ]]; then
-                apt-get update
-                apt-get install -y "${missing[@]}"
+                run_logged 'apt-get update' apt-get update
+                run_logged 'apt-get install' apt-get install -y "${missing[@]}"
             else
                 require_command sudo
-                sudo apt-get update
-                sudo apt-get install -y "${missing[@]}"
+                run_logged 'sudo apt-get update' sudo apt-get update
+                run_logged 'sudo apt-get install' sudo apt-get install -y "${missing[@]}"
             fi
         fi
     fi
@@ -235,19 +375,23 @@ ensure_android_toolchain() {
         if [[ ! -x "$sdkmanager" ]]; then
             mkdir -p "$sdk_root/cmdline-tools"
             local commandline_zip="$JOB_ROOT/commandlinetools-linux.zip"
-            curl -fsSL 'https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip' -o "$commandline_zip"
+            run_logged 'download Android command-line tools' curl -fsSL 'https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip' -o "$commandline_zip"
             local extract_dir="$JOB_ROOT/android-cmdline-tools"
             mkdir -p "$extract_dir"
-            unzip -q -o "$commandline_zip" -d "$extract_dir"
+            run_logged 'extract Android command-line tools' unzip -q -o "$commandline_zip" -d "$extract_dir"
             rm -rf -- "$sdk_root/cmdline-tools/latest"
-            mv "$extract_dir/cmdline-tools" "$sdk_root/cmdline-tools/latest"
+            run_logged 'install Android command-line tools' mv "$extract_dir/cmdline-tools" "$sdk_root/cmdline-tools/latest"
             sdkmanager="$sdk_root/cmdline-tools/latest/bin/sdkmanager"
         fi
         [[ -x "$sdkmanager" ]] || die "Android sdkmanager is not executable: $sdkmanager"
         set +o pipefail
-        yes | "$sdkmanager" --sdk_root="$sdk_root" --licenses >/dev/null 2>&1 || true
+        if [[ "$LOG_LEVEL" == off ]]; then
+            yes | "$sdkmanager" --sdk_root="$sdk_root" --licenses >>"$COMMAND_LOG" 2>&1 || true
+        else
+            yes | "$sdkmanager" --sdk_root="$sdk_root" --licenses 2>&1 >&2 || true
+        fi
         set -o pipefail
-        "$sdkmanager" --sdk_root="$sdk_root" "platform-tools" "platforms;android-$ANDROID_API" "ndk;$NDK_VERSION"
+        run_logged 'install Android SDK/NDK packages' "$sdkmanager" --sdk_root="$sdk_root" "platform-tools" "platforms;android-$ANDROID_API" "ndk;$NDK_VERSION"
     fi
 
     [[ -d "$ndk_path" ]] || die "Android NDK was not installed at $ndk_path"
@@ -271,7 +415,9 @@ prepare_vcpkg() {
     cp -a "$source_root/." "$local_root/"
     if [[ ! -f "$local_root/vcpkg" ]]; then
         [[ -x "$local_root/bootstrap-vcpkg.sh" ]] || die "bootstrap-vcpkg.sh not found in $source_root"
-        (cd "$local_root" && ./bootstrap-vcpkg.sh -disableMetrics)
+        if ! (cd "$local_root" && run_logged 'vcpkg bootstrap' ./bootstrap-vcpkg.sh -disableMetrics); then
+            die 'vcpkg bootstrap failed'
+        fi
     fi
     [[ -f "$local_root/vcpkg" ]] || die "vcpkg bootstrap failed"
     printf '%s\n' "$local_root"
@@ -433,7 +579,7 @@ bool AssimpView::HasModel() const {
 EOF
 
     cat > "$JOB_ROOT/assimpview.i" <<'EOF'
-%module AssimpView
+%module AssimpViewModule
 
 %{
 #include "AssimpViewBridge.h"
@@ -445,7 +591,7 @@ EOF
 
 generate_bindings() {
     mkdir -p "$JOB_ROOT/swig/csharp" "$JOB_ROOT/swig/cxx"
-    swig -c++ -csharp \
+    run_logged 'SWIG C# bindings' swig -c++ -csharp \
         -namespace Assimp.View.Maui \
         -doxygen \
         -dllimport assimpviewmaui \
@@ -551,7 +697,9 @@ publish() {
     LOCK_PATH=""
 }
 
+progress_init $((4 + 4 * ${#ABIS[@]}))
 install_host_dependencies
+progress_update 'host dependencies'
 require_command cmake
 require_command swig
 validate_swig
@@ -561,11 +709,14 @@ if [[ "$SKIP_INSTALL" == false ]]; then
 else
     : "${ANDROID_NDK_HOME:?ANDROID_NDK_HOME is required with --skip-install}"
 fi
+progress_update 'Android SDK and NDK'
 
 VCPKG_ROOT_EFFECTIVE="$(prepare_vcpkg)"
+progress_update 'vcpkg toolchain'
 OVERLAY_ROOT="$(create_overlay)"
 write_bridge_sources
 generate_bindings
+progress_update 'SWIG C# bindings'
 
 for rid in "${ABIS[@]}"; do
     abi="$(android_abi "$rid")"
@@ -576,7 +727,7 @@ for rid in "${ABIS[@]}"; do
     mkdir -p "$native_out" "$build_dir"
 
     if [[ "$SKIP_INSTALL" == false ]]; then
-        "$VCPKG_ROOT_EFFECTIVE/vcpkg" install \
+        run_logged "vcpkg install $rid" "$VCPKG_ROOT_EFFECTIVE/vcpkg" install \
             "--triplet=$triplet" \
             "--x-manifest-root=$OVERLAY_ROOT" \
             "--x-install-root=$install_root" \
@@ -585,9 +736,10 @@ for rid in "${ABIS[@]}"; do
         install_root="$VCPKG_ROOT_EFFECTIVE/installed"
         [[ -d "$install_root" ]] || die "--skip-install requires a populated vcpkg installed directory: $install_root"
     fi
+    progress_update "vcpkg $rid"
 
     write_cmake_project "$OVERLAY_ROOT" "$native_out" OFF
-    cmake -S "$JOB_ROOT/project" -B "$build_dir" -G Ninja \
+    run_logged "CMake configure $rid" cmake -S "$JOB_ROOT/project" -B "$build_dir" -G Ninja \
         "-DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT_EFFECTIVE/scripts/buildsystems/vcpkg.cmake" \
         "-DVCPKG_CHAINLOAD_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
         "-DVCPKG_TARGET_TRIPLET=$triplet" \
@@ -598,7 +750,9 @@ for rid in "${ABIS[@]}"; do
         "-DCMAKE_BUILD_TYPE=Release" \
         "-DANDROID_NDK=$ANDROID_NDK_HOME" \
         "-DUSE_PLATFORM=VK_USE_PLATFORM_ANDROID_KHR"
-    cmake --build "$build_dir" --config Release --parallel "$JOBS"
+    progress_update "CMake configure $rid"
+    run_logged "CMake build $rid" cmake --build "$build_dir" --config Release --parallel "$JOBS"
+    progress_update "CMake build $rid"
 
     mkdir -p "$JOB_ROOT/publish/$rid/native"
     while IFS= read -r -d '' native; do
@@ -614,6 +768,7 @@ for rid in "${ABIS[@]}"; do
 
     compgen -G "$JOB_ROOT/publish/$rid/native/*.so" >/dev/null || die "no Android native libraries were generated for $rid"
     publish "$rid"
+    progress_update "publish $rid"
     printf 'built Android %s (%s)\n' "$rid" "$abi"
 done
 
