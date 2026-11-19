@@ -1013,6 +1013,29 @@ install_atomic() {
     mv -f "$temporary" "$destination"
 }
 
+merge_apple_static_libraries() {
+    local rid="$1"
+    local native_out="$2"
+    local publish_root="$JOB_ROOT/publish/$rid/native"
+    local merged="$publish_root/libassimpviewmaui.a"
+    local native
+    local filename
+    local -a static_libraries=()
+
+    mkdir -p "$publish_root"
+    while IFS= read -r -d '' native; do
+        filename="$(basename "$native")"
+        # Assimp.Maui owns Assimp's public static library and publishes it
+        # separately. Keep it external to avoid duplicate Assimp symbols.
+        [[ "$filename" == libassimp.a ]] && continue
+        static_libraries+=("$native")
+    done < <(find "$native_out" -type f -name '*.a' -print0 | sort -z)
+
+    ((${#static_libraries[@]} > 0)) || die "no Apple static libraries were generated for $rid"
+    run_logged "libtool merge $rid" libtool -static -o "$merged" "${static_libraries[@]}"
+    [[ -s "$merged" ]] || die "libtool did not generate $merged"
+}
+
 publish() {
     local rid="$1"
     local platform
@@ -1049,7 +1072,7 @@ require_command swig
 validate_swig
 require_command xcrun
 require_command clang++
-require_command ar
+require_command libtool
 progress_update 'Apple toolchain'
 
 prepare_dependency_cache
@@ -1134,15 +1157,7 @@ for rid in "${ABIS[@]}"; do
     run_logged "CMake build $rid" cmake --build "$build_dir" --config Release --parallel "$JOBS"
     progress_update "CMake build $rid"
 
-    mkdir -p "$JOB_ROOT/publish/$rid/native"
-    while IFS= read -r -d '' native; do
-        case "$native" in
-            */debug/*|*/vcpkg/*|*/osre/*) continue ;;
-            */libassimp.a) continue ;;
-        esac
-        cp -f "$native" "$JOB_ROOT/publish/$rid/native/$(basename "$native")"
-    done < <(find "$JOB_ROOT" -type f \( -name '*.a' -o -name '*.dylib' \) -print0)
-    compgen -G "$JOB_ROOT/publish/$rid/native/*" >/dev/null || die "no Apple native libraries were generated for $rid"
+    merge_apple_static_libraries "$rid" "$native_out"
     publish "$rid"
     progress_update "publish $rid"
     progress_log "built Apple $rid ($platform)"

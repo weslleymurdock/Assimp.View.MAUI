@@ -870,7 +870,7 @@ set(OSRE_BUILD_DOC OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_ASSIMP_TOOLS OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_ZLIB ON CACHE BOOL "" FORCE)
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED_LIBS ON CACHE BOOL "" FORCE)
 add_subdirectory("$overlayPath" `${CMAKE_BINARY_DIR}/osre EXCLUDE_FROM_ALL)
 if(TARGET osre)
     target_include_directories(osre PRIVATE "$overlayPath")
@@ -969,11 +969,29 @@ function Publish([string]$TargetRid, [string]$NativeStage) {
         }
     }
     try {
-        Get-ChildItem -LiteralPath (Join-Path $JobRoot 'swig\csharp') -Filter '*.cs' -File | ForEach-Object {
-            Copy-Atomic $_.FullName (Join-Path $managedRoot $_.Name)
+        $managedFiles = @(Get-ChildItem -LiteralPath (Join-Path $JobRoot 'swig\csharp') -Filter '*.cs' -File)
+        if ($managedFiles.Count -eq 0) {
+            Fail "SWIG C# output was not found under $(Join-Path $JobRoot 'swig\csharp')"
         }
-        Get-ChildItem -LiteralPath $NativeStage -File | ForEach-Object {
-            Copy-Atomic $_.FullName (Join-Path $nativeRoot $_.Name)
+        foreach ($managedFile in $managedFiles) {
+            Copy-Atomic $managedFile.FullName (Join-Path $managedRoot $managedFile.Name)
+        }
+
+        $nativeFiles = @(Get-ChildItem -LiteralPath $NativeStage -File)
+        if ($nativeFiles.Count -eq 0) {
+            Fail "native publish output was not found under $NativeStage"
+        }
+        foreach ($nativeFile in $nativeFiles) {
+            Copy-Atomic $nativeFile.FullName (Join-Path $nativeRoot $nativeFile.Name)
+        }
+
+        $publishedManagedFiles = @(Get-ChildItem -LiteralPath $managedRoot -Filter '*.cs' -File)
+        if ($publishedManagedFiles.Count -ne $managedFiles.Count) {
+            Fail "only $($publishedManagedFiles.Count) of $($managedFiles.Count) SWIG C# files were published for $TargetRid"
+        }
+        $publishedNativeFiles = @(Get-ChildItem -LiteralPath $nativeRoot -File)
+        if ($publishedNativeFiles.Count -ne $nativeFiles.Count) {
+            Fail "only $($publishedNativeFiles.Count) of $($nativeFiles.Count) native files were published for $TargetRid"
         }
     }
     finally {
@@ -1006,7 +1024,7 @@ try {
 
     foreach ($targetRid in $Rid) {
         $vsArch = if ($targetRid -eq 'win-arm64') { 'ARM64' } else { 'x64' }
-        $triplet = if ($targetRid -eq 'win-arm64') { 'arm64-windows-static' } else { 'x64-windows-static' }
+        $triplet = if ($targetRid -eq 'win-arm64') { 'arm64-windows' } else { 'x64-windows' }
         $installRoot = Join-Path $JobRoot "vcpkg-installed\$targetRid"
         $nativeOut = Join-Path $JobRoot "native\$targetRid"
         $buildDir = Join-Path $JobRoot "build\$targetRid"
@@ -1031,6 +1049,9 @@ try {
         }
         Update-GradientProgress "vcpkg $targetRid"
 
+        # Keep the Windows dependency graph shared.  The generated import
+        # libraries (*.lib) accompany their DLLs; they are not folded into
+        # assimpviewmaui.dll, osre.dll, or cppcore.dll.
         Write-CMakeProject $overlay $nativeOut
         $cmakeArgs = @(
             '-S', (Join-Path $JobRoot 'project'),
@@ -1041,7 +1062,7 @@ try {
             "-DVCPKG_TARGET_TRIPLET=$triplet",
             "-DVCPKG_INSTALLED_DIR=$installRoot",
             '-DCMAKE_BUILD_TYPE=Release',
-            '-DBUILD_SHARED_LIBS=OFF',
+            '-DBUILD_SHARED_LIBS=ON',
             '-DASSIMP_BUILD_TESTS=OFF',
             '-DASSIMP_BUILD_ASSIMP_TOOLS=OFF',
             '-DASSIMP_BUILD_ZLIB=ON',
@@ -1066,15 +1087,19 @@ try {
         $nativeStage = Join-Path $JobRoot "publish\$targetRid\native"
         New-Item -ItemType Directory -Path $nativeStage -Force | Out-Null
         $nativeStageFullPath = ([System.IO.Path]::GetFullPath($nativeStage)).TrimEnd('\')
-        Get-ChildItem -Recurse -File -Path $JobRoot | Where-Object {
+        $nativeArtifacts = @(Get-ChildItem -Recurse -File -Path $JobRoot | Where-Object {
             $_.Extension -in '.dll', '.lib' -and
             $_.FullName -notmatch '\\debug\\|\\buildtrees\\|\\vcpkg\\' -and
             $_.FullName -notmatch '\\swig\\' -and
             $_.FullName -notlike "$nativeStageFullPath\*"
-        } | ForEach-Object {
-            Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $nativeStage $_.Name) -Force
+        })
+        if ($nativeArtifacts.Count -eq 0) {
+            Fail "no Windows native artifacts were generated for $targetRid"
         }
-        if (-not (Get-ChildItem -LiteralPath $nativeStage -Filter '*.dll' -File)) {
+        foreach ($nativeArtifact in $nativeArtifacts) {
+            Copy-Item -LiteralPath $nativeArtifact.FullName -Destination (Join-Path $nativeStage $nativeArtifact.Name) -Force
+        }
+        if (@(Get-ChildItem -LiteralPath $nativeStage -Filter '*.dll' -File).Count -eq 0) {
             Fail "no Windows DLL was generated for $targetRid"
         }
         Publish $targetRid $nativeStage

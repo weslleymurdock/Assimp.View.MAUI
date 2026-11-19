@@ -141,7 +141,7 @@ write_android_triplet() {
     cat > "$JOB_ROOT/triplets/$triplet.cmake" <<EOF
 set(VCPKG_TARGET_ARCHITECTURE $architecture)
 set(VCPKG_CRT_LINKAGE dynamic)
-set(VCPKG_LIBRARY_LINKAGE static)
+set(VCPKG_LIBRARY_LINKAGE dynamic)
 set(VCPKG_CMAKE_SYSTEM_NAME Android)
 set(VCPKG_CMAKE_SYSTEM_VERSION $ANDROID_API)
 set(VCPKG_MAKE_BUILD_TRIPLET "--host=$host_triplet")
@@ -1090,7 +1090,10 @@ for rid in "${ABIS[@]}"; do
     fi
     progress_update "vcpkg $rid"
 
-    write_cmake_project "$OVERLAY_ROOT" "$native_out" OFF
+    # Android publishes the viewer and its native dependencies as separate
+    # shared objects.  The vcpkg triplet and the OSRE targets must therefore
+    # remain dynamic; do not fold cppcore/osre into assimpviewmaui.so.
+    write_cmake_project "$OVERLAY_ROOT" "$native_out" ON
     run_logged "CMake configure $rid" cmake -S "$JOB_ROOT/project" -B "$build_dir" -G Ninja \
         "-DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT_EFFECTIVE/scripts/buildsystems/vcpkg.cmake" \
         "-DVCPKG_CHAINLOAD_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \

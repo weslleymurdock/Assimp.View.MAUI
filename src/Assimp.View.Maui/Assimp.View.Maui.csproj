@@ -4,32 +4,63 @@
 		<TargetFrameworks>net11.0-android</TargetFrameworks>
 		<TargetFrameworks Condition="!$([MSBuild]::IsOSPlatform('linux'))">$(TargetFrameworks);net11.0-ios;net11.0-maccatalyst</TargetFrameworks>
 		<TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('windows'))">$(TargetFrameworks);net11.0-windows10.0.19041.0</TargetFrameworks>
-
+		
 		<UseMaui>true</UseMaui>
 		<SingleProject>true</SingleProject>
 		<ImplicitUsings>enable</ImplicitUsings>
 		<Nullable>enable</Nullable>
-
+		
 		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'ios'">15.0</SupportedOSPlatformVersion>
 		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'maccatalyst'">17.0</SupportedOSPlatformVersion>
 		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'android'">24.0</SupportedOSPlatformVersion>
 		<SupportedOSPlatformVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">10.0.17763.0</SupportedOSPlatformVersion>
 		<TargetPlatformMinVersion Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'windows'">10.0.17763.0</TargetPlatformMinVersion>
+		
+		<PackageId>Assimp.View.Maui</PackageId>
+		<Version>0.0.4.0-rc1</Version>
+		<AssemblyVersion>0.0.4.0</AssemblyVersion>
+		<FileVersion>0.0.4.0</FileVersion>
+		<Title>Assimp.Maui</Title>
+		<Authors>Weslley Murdock</Authors>
+		<Company>Remote Code Hub</Company>
+		<PackageReleaseNotes>- 🚀 Initial release</PackageReleaseNotes>
+		<Copyright>Copyright ©2026 Remote Code Hub</Copyright>
+		<PackageTags>assimp;net;maui;native;assimp-net;android;ios;windows;maccatalyst;scene;game;game-dev;engine;assets;asset;3d</PackageTags>
+		<Description>Assimp.View.MAUI is a .NET MAUI wrapper and cross-platform binary distribution for the [Open Asset Import Library (Assimp) combined with OSRE (Open-SOurce Render Engine)](https://github.com/assimp/assimp_view). This package bundles pre-compiled native binaries targeting all .NET MAUI supported platforms and Runtime Identifiers (RIDs), providing a view for seamless loading and processing of over 40 3D model formats (such as OBJ, FBX, GLTF, COLLADA, and STL) in cross-platform applications.</Description>
+		<PackageLicenseExpression>BSD-3-Clause</PackageLicenseExpression>
+		<PackageRequireLicenseAcceptance>true</PackageRequireLicenseAcceptance>
+		<PackageProjectUrl>https://github.com/weslleymurdock/Assimp.View.MAUI</PackageProjectUrl>
+		<RepositoryUrl>https://github.com/weslleymurdock/Assimp.View.MAUI.git</RepositoryUrl>
+		<RepositoryType>git</RepositoryType>
+		<PackageIcon>icon.png</PackageIcon>
+		<PackageIconUrl>https://raw.githubusercontent.com/weslleymurdock/Assimp.View.MAUI/main/src/icon.png</PackageIconUrl>
+		<PackageReadmeFile>README.md</PackageReadmeFile>
+		<GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+	</PropertyGroup>
+
+	<PropertyGroup Condition="'$(IsOfficialBuild)' == 'true'">
+		<ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
+	</PropertyGroup>
+
+	<PropertyGroup Condition="'$(Configuration)' == 'Release'">
+		<DebugSymbols>true</DebugSymbols>
+		<DebugType>portable</DebugType>
 	</PropertyGroup>
 
 	<ItemGroup>
-		<!-- O viewer estende os bindings e os binários distribuídos por Assimp.Maui. -->
+		<PackageReference Include="Microsoft.SourceLink.GitHub" Version="11.0.100" PrivateAssets="all" />
+		<!-- The viewer inherits the bindings and native binaries distributed by Assimp.MAUI. -->
 		<PackageReference Include="Assimp.Maui" Version="6.0.6.0-rc1" />
 		<PackageReference Include="Microsoft.Maui.Controls" Version="$(MauiVersion)" />
 	</ItemGroup>
 
 	<ItemGroup>
-		<!-- Arquivos de raiz (Sem barra inicial no PackagePath) -->
+		<!-- Root directory files (Sem barra inicial no PackagePath) -->
 		<None Include="../../icon.png" Pack="true" PackagePath="icon.png" />
 		<None Include="../../LICENSE.md" Pack="true" PackagePath="LICENSE.md" />
 		<None Include="../../README.md" Pack="true" PackagePath="README.md" />
 
-		<None Include="build/Assimp.Maui.targets" Pack="true" PackagePath="build/" />
+		<None Include="build/Assimp.View.Maui.targets" Pack="true" PackagePath="build/" />
 
 		<None Include="Platforms/Android/runtimes/android-arm/native/**/*.*" Pack="true" PackagePath="runtimes/android-arm/native/" />
 		<None Include="Platforms/Android/runtimes/android-arm64/native/**/*.*" Pack="true" PackagePath="runtimes/android-arm64/native/" />
@@ -41,8 +72,9 @@
 
 		<None Include="Platforms/MacCatalyst/runtimes/maccatalyst-arm64/native/**/*.*" Pack="true" PackagePath="runtimes/maccatalyst-arm64/native/" />
 
-		<None Include="Platforms/Windows/runtimes/win-arm64/native/**/*.*" Pack="true" PackagePath="runtimes/win-arm64/native/" />
-		<None Include="Platforms/Windows/runtimes/win-x64/native/**/*.*" Pack="true" PackagePath="runtimes/win-x64/native/" />
+		<!-- Windows consumes the shared runtime graph; import/static .lib files are build artifacts and are not runtime NuGet assets. -->
+		<None Include="Platforms/Windows/runtimes/win-arm64/native/*.dll" Pack="true" PackagePath="runtimes/win-arm64/native/" />
+		<None Include="Platforms/Windows/runtimes/win-x64/native/*.dll" Pack="true" PackagePath="runtimes/win-x64/native/" />
 
 	</ItemGroup>
 

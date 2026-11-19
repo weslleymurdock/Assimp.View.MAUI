@@ -1,0 +1,73 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <!-- Keep this overrideable for prerelease/local package feeds. -->
+    <AssimpViewPackageId Condition="'$(AssimpViewPackageId)' == ''">Assimp.View.Maui</AssimpViewPackageId>
+    <AssimpViewPackageVersion Condition="'$(AssimpViewPackageVersion)' == ''">6.0.6.0-rc1</AssimpViewPackageVersion>
+    <NuGetPathUnix Condition="'$(MSBuildRuntimeType)' == 'Core' AND '$(OS)' != 'Windows_NT'">$(NuGetPackageRoot.Replace('\', '/'))</NuGetPathUnix>
+    <NuGetPathUnix Condition="'$(NuGetPathUnix)' == ''">$(NuGetPackageRoot)</NuGetPathUnix>
+    <AssimpViewNativePackageRoot>$(NuGetPathUnix)$(AssimpViewPackageId)/$(AssimpViewPackageVersion)/runtimes</AssimpViewNativePackageRoot>
+    <IsWindowsTarget Condition="'$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)'))' == 'windows'">true</IsWindowsTarget>
+    <IsWindowsTarget Condition="'$(IsWindowsTarget)' == ''">false</IsWindowsTarget>
+  </PropertyGroup>
+
+  <!-- Android native libraries are selected by ABI by the MAUI Android build. -->
+  <ItemGroup Condition="'$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)'))' == 'android'">
+    <AndroidNativeLibrary Include="$(AssimpViewNativePackageRoot)/android-arm/native/*.so">
+      <Abi>armeabi-v7a</Abi>
+      <Link>Platforms/Android/lib/armeabi-v7a/%(Filename)%(Extension)</Link>
+    </AndroidNativeLibrary>
+    <AndroidNativeLibrary Include="$(AssimpViewNativePackageRoot)/android-arm64/native/*.so">
+      <Abi>arm64-v8a</Abi>
+      <Link>Platforms/Android/lib/arm64-v8a/%(Filename)%(Extension)</Link>
+    </AndroidNativeLibrary>
+    <AndroidNativeLibrary Include="$(AssimpViewNativePackageRoot)/android-x86/native/*.so">
+      <Abi>x86</Abi>
+      <Link>Platforms/Android/lib/x86/%(Filename)%(Extension)</Link>
+    </AndroidNativeLibrary>
+    <AndroidNativeLibrary Include="$(AssimpViewNativePackageRoot)/android-x86_64/native/*.so">
+      <Abi>x86_64</Abi>
+      <Link>Platforms/Android/lib/x86_64/%(Filename)%(Extension)</Link>
+    </AndroidNativeLibrary>
+  </ItemGroup>
+
+  <!-- Each Apple RID contains one thin, RID-specific merged archive. -->
+  <ItemGroup Condition="'$(RuntimeIdentifier)' == 'ios-arm64'">
+    <NativeReference Include="$(AssimpViewNativePackageRoot)/ios-arm64/native/libassimpviewmaui.a">
+      <Kind>Static</Kind>
+      <ForceLoad>True</ForceLoad>
+      <SmartLink>False</SmartLink>
+    </NativeReference>
+  </ItemGroup>
+  <ItemGroup Condition="'$(RuntimeIdentifier)' == 'iossimulator-arm64'">
+    <NativeReference Include="$(AssimpViewNativePackageRoot)/iossimulator-arm64/native/libassimpviewmaui.a">
+      <Kind>Static</Kind>
+      <ForceLoad>True</ForceLoad>
+      <SmartLink>False</SmartLink>
+    </NativeReference>
+  </ItemGroup>
+  <ItemGroup Condition="'$(RuntimeIdentifier)' == 'maccatalyst-arm64'">
+    <NativeReference Include="$(AssimpViewNativePackageRoot)/maccatalyst-arm64/native/libassimpviewmaui.a">
+      <Kind>Static</Kind>
+      <ForceLoad>True</ForceLoad>
+      <SmartLink>False</SmartLink>
+    </NativeReference>
+  </ItemGroup>
+
+  <!-- Windows publishes every viewer DLL produced by the native build. -->
+  <ItemGroup Condition="'$(IsWindowsTarget)' == 'true' AND ('$(RuntimeIdentifier)' == 'win-x64' OR '$(Platform)' == 'x64')">
+    <None Include="$(NuGetPackageRoot)$(AssimpViewPackageId)\$(AssimpViewPackageVersion)\runtimes\win-x64\native\*.dll">
+      <Link>Platforms\Windows\Native\x64\%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>False</Visible>
+      <TargetPath>%(Filename)%(Extension)</TargetPath>
+    </None>
+  </ItemGroup>
+  <ItemGroup Condition="'$(IsWindowsTarget)' == 'true' AND ('$(RuntimeIdentifier)' == 'win-arm64' OR '$(Platform)' == 'ARM64' OR '$(Platform)' == 'arm64')">
+    <None Include="$(NuGetPackageRoot)$(AssimpViewPackageId)\$(AssimpViewPackageVersion)\runtimes\win-arm64\native\*.dll">
+      <Link>Platforms\Windows\Native\ARM64\%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Visible>False</Visible>
+      <TargetPath>%(Filename)%(Extension)</TargetPath>
+    </None>
+  </ItemGroup>
+</Project>
