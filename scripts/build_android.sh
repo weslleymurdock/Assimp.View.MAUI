@@ -2,6 +2,17 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
+# Keep tool output deterministic and English for local runs and CI logs.
+export LANG='en_US.UTF-8'
+export LANGUAGE='en_US:en'
+if locale -a 2>/dev/null | grep -Eiq '^en_US(\.utf-?8)?$'; then
+    export LC_ALL='en_US.UTF-8'
+elif locale -a 2>/dev/null | grep -Eiq '^C\.UTF-8$'; then
+    export LC_ALL='C.UTF-8'
+else
+    export LC_ALL='C'
+fi
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 
@@ -148,6 +159,7 @@ OUTPUT_ROOT="$REPO_ROOT"
 SSH_TARGET=""
 REMOTE_BUILD=false
 REQUESTED_VCPKG_ROOT="${VCPKG_ROOT:-}"
+CACHE_ROOT_EXPLICIT=false
 NDK_VERSION="${ANDROID_NDK_VERSION:-26.1.10909125}"
 ANDROID_API="${ANDROID_MIN_SDK_VERSION:-24}"
 JOBS="${CMAKE_BUILD_PARALLEL_LEVEL:-}"
@@ -243,10 +255,12 @@ while (($# > 0)); do
         --cache-root)
             (($# >= 2)) || die "$1 requires a value"
             CACHE_ROOT="$2"
+            CACHE_ROOT_EXPLICIT=true
             shift 2
             ;;
         --cache-root=*)
             CACHE_ROOT="${1#*=}"
+            CACHE_ROOT_EXPLICIT=true
             shift
             ;;
         --skip-install)
@@ -266,11 +280,18 @@ done
 if ((${#ABIS[@]} == 0)); then
     ABIS=(android-arm android-arm64 android-x86 android-x86_64)
 fi
-declare -A SEEN_ABIS=()
 UNIQUE_ABIS=()
 for rid in "${ABIS[@]}"; do
-    if [[ -z "${SEEN_ABIS[$rid]+present}" ]]; then
-        SEEN_ABIS[$rid]=1
+    duplicate=false
+    if ((${#UNIQUE_ABIS[@]} > 0)); then
+        for unique_rid in "${UNIQUE_ABIS[@]}"; do
+            if [[ "$unique_rid" == "$rid" ]]; then
+                duplicate=true
+                break
+            fi
+        done
+    fi
+    if [[ "$duplicate" == false ]]; then
         UNIQUE_ABIS+=("$rid")
     fi
 done
@@ -287,6 +308,10 @@ if [[ -n "$SSH_TARGET" && "$REMOTE_BUILD" == false ]]; then
     require_command scp
     require_command tar
 
+    [[ -f "$REPO_ROOT/swig/AssimpViewBridge.h" ]] || die "SWIG bridge source not found: $REPO_ROOT/swig/AssimpViewBridge.h"
+    [[ -f "$REPO_ROOT/swig/AssimpViewBridge.cpp" ]] || die "SWIG bridge source not found: $REPO_ROOT/swig/AssimpViewBridge.cpp"
+    [[ -f "$REPO_ROOT/swig/assimpview.i" ]] || die "SWIG interface not found: $REPO_ROOT/swig/assimpview.i"
+
     LOCAL_JOB="$(mktemp -d "${TMPDIR:-/tmp}/assimp-view-maui-android-ssh.XXXXXX")"
     cleanup_remote() { rm -rf -- "$LOCAL_JOB"; }
     trap cleanup_remote EXIT
@@ -297,6 +322,7 @@ if [[ -n "$SSH_TARGET" && "$REMOTE_BUILD" == false ]]; then
         lib/assimp_view/src \
         lib/assimp_view/contrib/osre \
         src/Assimp.View.Maui \
+        swig \
         scripts/build_android.sh
 
     remote_dir="$(ssh "$SSH_TARGET" 'mktemp -d /tmp/assimp-view-maui-android-ssh.XXXXXX')"
@@ -311,6 +337,7 @@ if [[ -n "$SSH_TARGET" && "$REMOTE_BUILD" == false ]]; then
     ssh "$SSH_TARGET" "cd '$remote_dir' && mkdir source && tar -xzf source.tar.gz -C source"
 
     remote_args=(--remote-build --output-root "$remote_dir/output" --ndk-version "$NDK_VERSION" --api "$ANDROID_API" --jobs "$JOBS" --log-level "$LOG_LEVEL" --progress "$PROGRESS_MODE")
+    [[ "$CACHE_ROOT_EXPLICIT" == true ]] && remote_args+=(--cache-root "$CACHE_ROOT")
     for rid in "${ABIS[@]}"; do
         remote_args+=(--rid "$rid")
     done
@@ -608,7 +635,7 @@ prepare_vcpkg() {
         fi
         sleep 0.2
     done
-    printf '%s\n' "$BASHPID" > "$cache_lock/pid"
+    printf '%s\n' "$$" > "$cache_lock/pid"
     if [[ -x "$cached_root/vcpkg" && -f "$marker" && "$(<"$marker")" == "$source_hash" ]]; then
         rm -f -- "$cache_lock/pid"
         rmdir "$cache_lock"
@@ -791,9 +818,7 @@ private:
 EOF
 
     cat > "$JOB_ROOT/AssimpViewBridge.cpp" <<'EOF'
-#define protected public
 #include "ModelLoadingApp.h"
-#undef protected
 
 #include "AssimpViewBridge.h"
 #include "IO/Uri.h"
@@ -898,6 +923,13 @@ EOF
 
 %include "AssimpViewBridge.h"
 EOF
+
+    # Keep the native facade and SWIG surface in one source-controlled template.
+    cp "$REPO_ROOT/swig/AssimpViewBridge.h" "$JOB_ROOT/AssimpViewBridge.h"
+    cp "$REPO_ROOT/swig/AssimpViewBridge.cpp" "$JOB_ROOT/AssimpViewBridge.cpp"
+    cp "$REPO_ROOT/swig/assimpview.i" "$JOB_ROOT/assimpview.i"
+    perl -0pe 's/#include "ModelLoadingApp\.h"/#if defined(ASSIMP_VIEW_MODEL_LOADING_ACCESS_SHIM)\n#define protected public\n#endif\n#include "ModelLoadingApp.h"\n#if defined(ASSIMP_VIEW_MODEL_LOADING_ACCESS_SHIM)\n#undef protected\n#endif/' \
+        "$REPO_ROOT/lib/assimp_view/src/ModelLoading.cpp" > "$JOB_ROOT/ModelLoading.cpp"
 }
 
 generate_bindings() {
@@ -946,9 +978,11 @@ set(BUILD_SHARED_LIBS ${build_shared} CACHE BOOL "" FORCE)
 add_subdirectory("${overlay}" "\${CMAKE_BINARY_DIR}/osre" EXCLUDE_FROM_ALL)
 
 add_library(assimpviewmaui SHARED
-    "${REPO_ROOT}/lib/assimp_view/src/ModelLoading.cpp"
+    "${JOB_ROOT}/ModelLoading.cpp"
     "${JOB_ROOT}/AssimpViewBridge.cpp"
     "${JOB_ROOT}/swig/cxx/assimpviewmaui.cxx")
+set_source_files_properties("${JOB_ROOT}/ModelLoading.cpp" PROPERTIES
+    COMPILE_DEFINITIONS ASSIMP_VIEW_MODEL_LOADING_ACCESS_SHIM)
 target_include_directories(assimpviewmaui PRIVATE
     "${REPO_ROOT}/lib/assimp_view/src"
     "${overlay}/src/Engine"
@@ -977,7 +1011,7 @@ EOF
 install_atomic() {
     local source="$1"
     local destination="$2"
-    local temporary="${destination}.tmp.${BASHPID}.${RANDOM}"
+    local temporary="${destination}.tmp.$$.${RANDOM}"
     cp -f "$source" "$temporary"
     mv -f "$temporary" "$destination"
 }

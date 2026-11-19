@@ -2,6 +2,17 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
+# Keep tool output deterministic and English for local runs and CI logs.
+export LANG='en_US.UTF-8'
+export LANGUAGE='en_US:en'
+if locale -a 2>/dev/null | grep -Eiq '^en_US(\.utf-?8)?$'; then
+    export LC_ALL='en_US.UTF-8'
+elif locale -a 2>/dev/null | grep -Eiq '^C\.UTF-8$'; then
+    export LC_ALL='C.UTF-8'
+else
+    export LC_ALL='C'
+fi
+
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 
@@ -100,6 +111,7 @@ ABIS=()
 OUTPUT_ROOT="$REPO_ROOT"
 SSH_TARGET=""
 REQUESTED_VCPKG_ROOT="${VCPKG_ROOT:-}"
+CACHE_ROOT_EXPLICIT=false
 if [[ -n "${ASSIMP_VIEW_MAUI_DEPS_ROOT:-}" ]]; then
     CACHE_ROOT="$ASSIMP_VIEW_MAUI_DEPS_ROOT"
 elif [[ -n "${XDG_CACHE_HOME:-}" ]]; then
@@ -163,10 +175,12 @@ while (($# > 0)); do
         --cache-root)
             (($# >= 2)) || die "$1 requires a value"
             CACHE_ROOT="$2"
+            CACHE_ROOT_EXPLICIT=true
             shift 2
             ;;
         --cache-root=*)
             CACHE_ROOT="${1#*=}"
+            CACHE_ROOT_EXPLICIT=true
             shift
             ;;
         --jobs)
@@ -213,11 +227,18 @@ done
 if ((${#ABIS[@]} == 0)); then
     ABIS=(ios-arm64 iossimulator-arm64 maccatalyst-arm64)
 fi
-declare -A SEEN_ABIS=()
 UNIQUE_ABIS=()
 for rid in "${ABIS[@]}"; do
-    if [[ -z "${SEEN_ABIS[$rid]+present}" ]]; then
-        SEEN_ABIS[$rid]=1
+    duplicate=false
+    if ((${#UNIQUE_ABIS[@]} > 0)); then
+        for unique_rid in "${UNIQUE_ABIS[@]}"; do
+            if [[ "$unique_rid" == "$rid" ]]; then
+                duplicate=true
+                break
+            fi
+        done
+    fi
+    if [[ "$duplicate" == false ]]; then
         UNIQUE_ABIS+=("$rid")
     fi
 done
@@ -227,10 +248,42 @@ if [[ -z "$JOBS" ]]; then
 fi
 [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || die "--jobs must be a positive integer"
 
+clean_published_outputs() {
+    [[ -n "$OUTPUT_ROOT" && "$OUTPUT_ROOT" != / ]] || die 'refusing to clean an empty or root output path'
+
+    local rid platform platform_root native_root clean_lock
+    for rid in "${ABIS[@]}"; do
+        case "$rid" in
+            ios-arm64|iossimulator-arm64) platform=iOS ;;
+            maccatalyst-arm64) platform=MacCatalyst ;;
+            *) die "no Apple platform mapping for $rid" ;;
+        esac
+
+        platform_root="$OUTPUT_ROOT/src/Assimp.View.Maui/Platforms/$platform"
+        native_root="$platform_root/runtimes/$rid/native"
+        mkdir -p "$platform_root"
+        clean_lock="$platform_root/.assimp-view-clean.lock"
+        until mkdir "$clean_lock" 2>/dev/null; do
+            sleep 0.2
+        done
+
+        # The build itself always uses a fresh JOB_ROOT. Remove only published
+        # generated code/native output for the requested platform and RID;
+        # dependency/download caches remain intact.
+        rm -rf -- "$platform_root/AssimpView" "$native_root"
+        rmdir "$clean_lock"
+    done
+}
+
 if [[ -n "$SSH_TARGET" && "$REMOTE_BUILD" == false ]]; then
+    clean_published_outputs
     require_command ssh
     require_command scp
     require_command tar
+
+    [[ -f "$REPO_ROOT/swig/AssimpViewBridge.h" ]] || die "SWIG bridge source not found: $REPO_ROOT/swig/AssimpViewBridge.h"
+    [[ -f "$REPO_ROOT/swig/AssimpViewBridge.cpp" ]] || die "SWIG bridge source not found: $REPO_ROOT/swig/AssimpViewBridge.cpp"
+    [[ -f "$REPO_ROOT/swig/assimpview.i" ]] || die "SWIG interface not found: $REPO_ROOT/swig/assimpview.i"
 
     LOCAL_JOB="$(mktemp -d "${TMPDIR:-/tmp}/assimp-view-maui-ssh.XXXXXX")"
     cleanup_remote() {
@@ -244,6 +297,7 @@ if [[ -n "$SSH_TARGET" && "$REMOTE_BUILD" == false ]]; then
         lib/assimp_view/src \
         lib/assimp_view/contrib/osre \
         src/Assimp.View.Maui \
+        swig \
         scripts/build_apple.sh
 
     remote_dir="$(ssh "$SSH_TARGET" 'mktemp -d /tmp/assimp-view-maui-ssh.XXXXXX')"
@@ -264,6 +318,7 @@ if [[ -n "$SSH_TARGET" && "$REMOTE_BUILD" == false ]]; then
     remote_args+=(--jobs "$JOBS")
     remote_args+=(--log-level "$LOG_LEVEL")
     remote_args+=(--progress "$PROGRESS_MODE")
+    [[ "$CACHE_ROOT_EXPLICIT" == true ]] && remote_args+=(--cache-root "$CACHE_ROOT")
     [[ "$SKIP_INSTALL" == true ]] && remote_args+=(--skip-install)
 
     remote_command="cd '$remote_dir/source' && bash scripts/build_apple.sh"
@@ -281,14 +336,22 @@ fi
 
 [[ "$(uname -s)" == Darwin ]] || die 'direct Apple builds require macOS; use --ssh user@mac-host from another host'
 
+clean_published_outputs
+
 JOB_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/assimp-view-maui-apple.XXXXXX")"
 LOCK_PATH=""
 cleanup() {
+    local exit_status=$?
     progress_finish
     if [[ -n "$LOCK_PATH" ]]; then
         rmdir "$LOCK_PATH" 2>/dev/null || true
     fi
-    rm -rf -- "$JOB_ROOT"
+    if ((exit_status == 0)); then
+        rm -rf -- "$JOB_ROOT"
+    else
+        printf 'Apple build failed; temporary logs retained at %s\n' "$JOB_ROOT" >&2
+    fi
+    return "$exit_status"
 }
 trap cleanup EXIT
 
@@ -418,16 +481,35 @@ source_fingerprint() {
         untracked="$(git -C "$source_root" ls-files --others --exclude-standard -z 2>/dev/null | while IFS= read -r -d '' file; do shasum -a 256 "$source_root/$file"; done | shasum -a 256 | awk '{print $1}')"
         printf '%s:%s:%s\n' "$revision" "$dirty" "$untracked"
     else
-        find "$source_root" -type f -exec shasum -a 256 {} \; | LC_ALL=C sort | shasum -a 256 | awk '{print $1}'
+        find "$source_root" -type f -print0 | xargs -0 shasum -a 256 | LC_ALL=C sort | shasum -a 256 | awk '{print $1}'
     fi
 }
 
+ensure_homebrew_path() {
+    if command -v brew >/dev/null 2>&1; then
+        return
+    fi
+
+    local candidate brew_dir
+    for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew; do
+        if [[ -x "$candidate" ]]; then
+            brew_dir="$(dirname "$candidate")"
+            case ":$PATH:" in
+                *":$brew_dir:"*) ;;
+                *) export PATH="$brew_dir:$PATH" ;;
+            esac
+            return
+        fi
+    done
+}
+
 install_host_dependencies() {
+    ensure_homebrew_path
     if [[ "$SKIP_INSTALL" == true ]]; then
         return
     fi
     require_command brew
-    for package in cmake ninja swig; do
+    for package in cmake ninja swig pkg-config; do
         if ! brew list --formula "$package" >/dev/null 2>&1; then
             run_logged "brew install $package" brew install "$package"
         fi
@@ -466,7 +548,7 @@ prepare_vcpkg() {
         fi
         sleep 0.2
     done
-    printf '%s\n' "$BASHPID" > "$cache_lock/pid"
+    printf '%s\n' "$$" > "$cache_lock/pid"
     if [[ -x "$cached_root/vcpkg" && -f "$marker" && "$(<"$marker")" == "$source_hash" ]]; then
         rm -f -- "$cache_lock/pid"
         rmdir "$cache_lock"
@@ -504,14 +586,159 @@ prepare_overlay() {
     mkdir -p "$overlay"
     cp -a "$REPO_ROOT/lib/assimp_view/contrib/osre/." "$overlay/"
 
+    # SDL 2.32.x needs a small Catalyst-only compatibility shim. Keep the
+    # official Apple target macros intact, select SDL's UIKit sources, and
+    # disable the unused Metal renderer (the viewer uses OpenGL).
+    local port_overlay="$JOB_ROOT/vcpkg-ports"
+    mkdir -p "$port_overlay"
+    cp -a "$VCPKG_ROOT_EFFECTIVE/ports/sdl2" "$port_overlay/"
+
+    cat > "$overlay/vcpkg.json" <<'EOF'
+{
+  "dependencies": [
+    "glm",
+    "sdl2"
+  ]
+}
+EOF
+
+    mkdir -p "$JOB_ROOT/apple-compat/include/GL"
+    cat > "$JOB_ROOT/apple-compat/include/GL/glew.h" <<'EOF'
+#pragma once
+
+#include <TargetConditionals.h>
+
+#if TARGET_OS_IPHONE && !TARGET_OS_MACCATALYST
+#include <OpenGLES/ES3/gl.h>
+#include <OpenGLES/ES2/glext.h>
+#else
+#include <OpenGL/gl3.h>
+#include <OpenGL/glext.h>
+#endif
+
+#if TARGET_OS_IPHONE && !TARGET_OS_MACCATALYST
+#ifndef GL_TEXTURE_1D
+#define GL_TEXTURE_1D GL_TEXTURE_2D
+#endif
+#ifndef GL_POINT
+#define GL_POINT 0x1B00
+#endif
+#ifndef GL_LINE
+#define GL_LINE 0x1B01
+#endif
+#ifndef GL_FILL
+#define GL_FILL 0x1B02
+#endif
+#ifndef GL_GEOMETRY_SHADER
+#define GL_GEOMETRY_SHADER 0x8DD9
+#endif
+#ifndef GL_TESS_EVALUATION_SHADER
+#define GL_TESS_EVALUATION_SHADER 0x8E87
+#endif
+#ifndef GL_CONTEXT_PROFILE_MASK
+#define GL_CONTEXT_PROFILE_MASK 0x9126
+#endif
+#ifndef GL_MAX_TEXTURE_UNITS
+#define GL_MAX_TEXTURE_UNITS GL_MAX_TEXTURE_IMAGE_UNITS
+#endif
+#ifndef GL_MAX_TEXTURE_COORDS
+#define GL_MAX_TEXTURE_COORDS GL_MAX_VERTEX_ATTRIBS
+#endif
+#ifndef GL_LIGHTING
+#define GL_LIGHTING 0x0B50
+#endif
+#ifndef GL_MULTISAMPLE
+#define GL_MULTISAMPLE 0x809D
+#endif
+#ifndef GL_CLAMP
+#define GL_CLAMP GL_CLAMP_TO_EDGE
+#endif
+#ifndef GL_BGR_EXT
+#define GL_BGR_EXT GL_RGB
+#endif
+
+static inline void glFramebufferTexture(GLenum target, GLenum attachment,
+        GLuint texture, GLint level) {
+    glFramebufferTexture2D(target, attachment, GL_TEXTURE_2D, texture, level);
+}
+
+static inline void glPolygonMode(GLenum, GLenum) {
+    // Polygon mode is not part of OpenGL ES; filled rasterization is the
+    // portable default for the iOS renderer.
+}
+#endif
+
+#if TARGET_OS_MACCATALYST
+/* macOS OpenGL headers omit legacy constants still referenced by OSRE. */
+#ifndef GL_MAX_TEXTURE_UNITS
+#define GL_MAX_TEXTURE_UNITS GL_MAX_TEXTURE_IMAGE_UNITS
+#endif
+#ifndef GL_MAX_TEXTURE_COORDS
+#define GL_MAX_TEXTURE_COORDS GL_MAX_VERTEX_ATTRIBS
+#endif
+#ifndef GL_LIGHTING
+#define GL_LIGHTING 0x0B50
+#endif
+#ifndef GL_CLAMP
+#define GL_CLAMP GL_CLAMP_TO_EDGE
+#endif
+#endif
+
+#ifndef GLEW_OK
+#define GLEW_OK 0
+#endif
+
+static GLboolean glewExperimental = GL_TRUE;
+static inline GLenum glewInit(void) { return GLEW_OK; }
+EOF
+    cat > "$JOB_ROOT/apple-compat/include/GL/gl.h" <<'EOF'
+#pragma once
+
+#include <GL/glew.h>
+EOF
+
+    cat > "$JOB_ROOT/maccatalyst-compat.h" <<'EOF'
+#pragma once
+
+#include <TargetConditionals.h>
+
+/* SDL_platform.h rewrites Apple's target macros and treats Catalyst as iOS.
+ * Keep Apple's official TargetConditionals intact and bypass only SDL's
+ * internal platform header so SDL_opengl.h exposes the desktop API. */
+#define SDL_platform_h_
+#define __IPHONEOS__ 1
+#undef __MACOSX__
+#ifndef MAC_OS_X_VERSION_MIN_REQUIRED
+#define MAC_OS_X_VERSION_MIN_REQUIRED 150000
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+extern const char *SDL_GetPlatform(void);
+#ifdef __cplusplus
+}
+#endif
+EOF
+
     perl -0pi -e 's/#elif defined\(__APPLE__\) \|\| defined\(__MACH__\)\r?\n#\s*error "Currently not supported platform"/#elif defined(__APPLE__) || defined(__MACH__)\n#    define OSRE_APPLE/' \
         "$overlay/src/Engine/Common/osre_common.h"
+    perl -0pi -e 's/find_package\(GLEW\s+REQUIRED\)/if(NOT APPLE)\n    find_package(GLEW REQUIRED)\n    set(OSRE_GLEW_LINK GLEW::GLEW)\nendif()/' \
+        "$overlay/CMakeLists.txt"
+    perl -0pi -e 's/\n    glEnable\(GL_MULTISAMPLE\);/\n#if !defined(__ANDROID__) \&\& !defined(__APPLE__)\n    glEnable(GL_MULTISAMPLE);\n#endif/' \
+        "$overlay/src/Engine/RenderBackend/OGLRenderer/OGLRenderBackend.cpp"
+    perl -0pi -e 's/#if defined\(MACOS\) \|\| defined\(TARGET_OS_MAC\)/#if defined(MACOS) || (defined(TARGET_OS_MAC) \&\& !defined(__APPLE__))/' \
+        "$overlay/contrib/assimp/contrib/zlib/zutil.h"
+    perl -0pi -e 's/#include <malloc\.h>/#if defined(__APPLE__)\n#include <stdlib.h>\n#else\n#include <malloc.h>\n#endif/' \
+        "$overlay/contrib/cppcore/include/cppcore/CPPCoreCommon.h"
+    sed -i '' 's/rhs\.m_QueueData/rhs.mQueueData/g' \
+        "$overlay/contrib/cppcore/include/cppcore/Container/TQueue.h"
     perl -0pi -e 's/ADD_LIBRARY\(\s*osre\s+SHARED/ADD_LIBRARY( osre STATIC/' \
         "$overlay/src/Engine/CMakeLists.txt"
     perl -0pi -e 's/ADD_LIBRARY\(\s*cppcore\s+SHARED/ADD_LIBRARY( cppcore STATIC/' \
         "$overlay/contrib/cppcore/CMakeLists.txt"
     sed -i '' 's/cppcore)/$<TARGET_NAME_IF_EXISTS:cppcore>)/g' "$overlay/src/Engine/CMakeLists.txt"
-    sed -i '' 's/target_link_libraries ( osre cppcore zlibstatic GLEW::GLEW ${platform_libs} assimp )/target_link_libraries ( osre $<TARGET_NAME_IF_EXISTS:cppcore> $<TARGET_NAME_IF_EXISTS:zlibstatic> GLEW::GLEW ${platform_libs} $<TARGET_NAME_IF_EXISTS:assimp> )/' "$overlay/src/Engine/CMakeLists.txt"
+    sed -i '' 's/target_link_libraries ( osre cppcore zlibstatic GLEW::GLEW ${platform_libs} assimp )/target_link_libraries ( osre $<TARGET_NAME_IF_EXISTS:cppcore> $<TARGET_NAME_IF_EXISTS:zlibstatic> ${OSRE_GLEW_LINK} ${platform_libs} $<TARGET_NAME_IF_EXISTS:assimp> )/' "$overlay/src/Engine/CMakeLists.txt"
     printf '%s\n' "$overlay"
 }
 
@@ -562,9 +789,7 @@ private:
 EOF
 
     cat > "$JOB_ROOT/AssimpViewBridge.cpp" <<'EOF'
-#define protected public
 #include "ModelLoadingApp.h"
-#undef protected
 
 #include "AssimpViewBridge.h"
 #include "IO/Uri.h"
@@ -637,6 +862,13 @@ EOF
 %}
 %include "AssimpViewBridge.h"
 EOF
+
+    # Keep the native facade and SWIG surface in one source-controlled template.
+    cp "$REPO_ROOT/swig/AssimpViewBridge.h" "$JOB_ROOT/AssimpViewBridge.h"
+    cp "$REPO_ROOT/swig/AssimpViewBridge.cpp" "$JOB_ROOT/AssimpViewBridge.cpp"
+    cp "$REPO_ROOT/swig/assimpview.i" "$JOB_ROOT/assimpview.i"
+    perl -0pe 's/#include "ModelLoadingApp\.h"/#if defined(ASSIMP_VIEW_MODEL_LOADING_ACCESS_SHIM)\n#define protected public\n#endif\n#include "ModelLoadingApp.h"\n#if defined(ASSIMP_VIEW_MODEL_LOADING_ACCESS_SHIM)\n#undef protected\n#endif/' \
+        "$REPO_ROOT/lib/assimp_view/src/ModelLoading.cpp" > "$JOB_ROOT/ModelLoading.cpp"
 }
 
 generate_bindings() {
@@ -658,7 +890,7 @@ write_triplet() {
     local triplet_file="$JOB_ROOT/triplets/$triplet.cmake"
     mkdir -p "$JOB_ROOT/triplets"
     if [[ "$rid" == maccatalyst-arm64 ]]; then
-        cat > "$triplet_file" <<'EOF'
+        cat > "$triplet_file" <<EOF
 set(VCPKG_TARGET_ARCHITECTURE arm64)
 set(VCPKG_CMAKE_SYSTEM_NAME Darwin)
 set(VCPKG_LIBRARY_LINKAGE static)
@@ -666,8 +898,21 @@ set(VCPKG_CRT_LINKAGE dynamic)
 set(VCPKG_CMAKE_CONFIGURE_OPTIONS
     "-DCMAKE_OSX_SYSROOT=macosx"
     "-DCMAKE_OSX_ARCHITECTURES=arm64"
-    "-DCMAKE_C_FLAGS=-target arm64-apple-ios15.0-macabi"
-    "-DCMAKE_CXX_FLAGS=-target arm64-apple-ios15.0-macabi")
+    "-DSDL_OPENGL=ON"
+    "-DSDL_OPENGLES=OFF"
+    "-DIOS=ON"
+    "-DSDL_METAL=OFF"
+    "-DSDL_RENDER_METAL=OFF"
+    "-DSDL_HIDAPI=OFF"
+    "-DSDL_JOYSTICK=OFF"
+    "-DSDL_HAPTIC=OFF"
+    "-DSDL_FILESYSTEM=OFF"
+    "-DSDL_FILE=OFF"
+    "-DSDL_LOCALE=OFF"
+    "-DSDL_MISC=OFF"
+    "-DSDL_AUDIO=OFF"
+    "-DCMAKE_C_FLAGS=-F$(xcrun --sdk macosx --show-sdk-path)/System/iOSSupport/System/Library/Frameworks -iframework $(xcrun --sdk macosx --show-sdk-path)/System/iOSSupport/System/Library/Frameworks -include ${JOB_ROOT}/maccatalyst-compat.h -target arm64-apple-ios15.0-macabi"
+    "-DCMAKE_CXX_FLAGS=-F$(xcrun --sdk macosx --show-sdk-path)/System/iOSSupport/System/Library/Frameworks -iframework $(xcrun --sdk macosx --show-sdk-path)/System/iOSSupport/System/Library/Frameworks -include ${JOB_ROOT}/maccatalyst-compat.h -target arm64-apple-ios15.0-macabi")
 EOF
     elif [[ "$rid" == iossimulator-arm64 ]]; then
         cat > "$triplet_file" <<'EOF'
@@ -714,6 +959,7 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${native_out}")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${native_out}")
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${native_out}")
 set(CMAKE_MODULE_PATH "${overlay}/contrib/assimp/cmake-modules" \${CMAKE_MODULE_PATH})
+include_directories(BEFORE "${JOB_ROOT}/apple-compat/include")
 set(OSRE_BUILD_PLAYER OFF CACHE BOOL "" FORCE)
 set(OSRE_BUILD_SAMPLES OFF CACHE BOOL "" FORCE)
 set(OSRE_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -724,10 +970,17 @@ set(ASSIMP_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(ASSIMP_BUILD_ZLIB ON CACHE BOOL "" FORCE)
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 add_subdirectory("${overlay}" "\${CMAKE_BINARY_DIR}/osre" EXCLUDE_FROM_ALL)
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    target_link_libraries(osre "-framework OpenGLES")
+else()
+    target_link_libraries(osre "-framework OpenGL")
+endif()
 add_library(assimpviewmaui STATIC
-    "${REPO_ROOT}/lib/assimp_view/src/ModelLoading.cpp"
+    "${JOB_ROOT}/ModelLoading.cpp"
     "${JOB_ROOT}/AssimpViewBridge.cpp"
     "${JOB_ROOT}/swig/cxx/assimpviewmaui.cxx")
+set_source_files_properties("${JOB_ROOT}/ModelLoading.cpp" PROPERTIES
+    COMPILE_DEFINITIONS ASSIMP_VIEW_MODEL_LOADING_ACCESS_SHIM)
 target_include_directories(assimpviewmaui PRIVATE
     "${REPO_ROOT}/lib/assimp_view/src"
     "${overlay}/src/Engine"
@@ -755,7 +1008,7 @@ EOF
 install_atomic() {
     local source="$1"
     local destination="$2"
-    local temporary="${destination}.tmp.${BASHPID}.${RANDOM}"
+    local temporary="${destination}.tmp.$$.${RANDOM}"
     cp -f "$source" "$temporary"
     mv -f "$temporary" "$destination"
 }
@@ -846,6 +1099,8 @@ for rid in "${ABIS[@]}"; do
         run_logged "vcpkg install $rid" "$VCPKG_ROOT_EFFECTIVE/vcpkg" install \
             "--triplet=$triplet" \
             "--overlay-triplets=$JOB_ROOT/triplets" \
+            "--overlay-ports=$JOB_ROOT/vcpkg-ports" \
+            "--x-buildtrees-root=$JOB_ROOT/vcpkg-buildtrees" \
             "--x-manifest-root=$OVERLAY_ROOT" \
             "--x-install-root=$install_root" \
             --clean-after-build
@@ -863,6 +1118,7 @@ for rid in "${ABIS[@]}"; do
         "-DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT_EFFECTIVE/scripts/buildsystems/vcpkg.cmake"
         "-DVCPKG_TARGET_TRIPLET=$triplet"
         "-DVCPKG_OVERLAY_TRIPLETS=$JOB_ROOT/triplets"
+        "-DVCPKG_OVERLAY_PORTS=$JOB_ROOT/vcpkg-ports"
         "-DVCPKG_INSTALLED_DIR=$install_root"
         "-DCMAKE_SYSTEM_NAME=$system_name"
         "-DCMAKE_OSX_SYSROOT=$sysroot"
